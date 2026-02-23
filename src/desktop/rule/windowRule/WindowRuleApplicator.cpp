@@ -4,8 +4,7 @@
 #include "../utils/SetUtils.hpp"
 #include "../../view/Window.hpp"
 #include "../../types/OverridableVar.hpp"
-#include "../../../managers/LayoutManager.hpp"
-#include "../../../managers/HookSystemManager.hpp"
+#include "../../../event/EventBus.hpp"
 
 #include <hyprutils/string/String.hpp>
 
@@ -265,13 +264,17 @@ CWindowRuleApplicator::SRuleResult CWindowRuleApplicator::applyDynamicRule(const
                     if (!m_window)
                         break;
 
-                    const auto VEC = configStringToVector2D(effect);
-                    if (VEC.x < 1 || VEC.y < 1) {
+                    const auto VEC = m_window->calculateExpression(effect);
+                    if (!VEC) {
+                        Log::logger->log(Log::ERR, "failed to parse {} as an expression", effect);
+                        break;
+                    }
+                    if (VEC->x < 1 || VEC->y < 1) {
                         Log::logger->log(Log::ERR, "Invalid size for maxsize");
                         break;
                     }
 
-                    m_maxSize.first = Types::COverridableVar(VEC, Types::PRIORITY_WINDOW_RULE);
+                    m_maxSize.first = Types::COverridableVar(*VEC, Types::PRIORITY_WINDOW_RULE);
 
                     if (*PCLAMP_TILED || m_window->m_isFloating)
                         m_window->clampWindowSize(std::nullopt, m_maxSize.first.value());
@@ -286,13 +289,18 @@ CWindowRuleApplicator::SRuleResult CWindowRuleApplicator::applyDynamicRule(const
                     if (!m_window)
                         break;
 
-                    const auto VEC = configStringToVector2D(effect);
-                    if (VEC.x < 1 || VEC.y < 1) {
+                    const auto VEC = m_window->calculateExpression(effect);
+                    if (!VEC) {
+                        Log::logger->log(Log::ERR, "failed to parse {} as an expression", effect);
+                        break;
+                    }
+
+                    if (VEC->x < 1 || VEC->y < 1) {
                         Log::logger->log(Log::ERR, "Invalid size for maxsize");
                         break;
                     }
 
-                    m_minSize.first = Types::COverridableVar(VEC, Types::PRIORITY_WINDOW_RULE);
+                    m_minSize.first = Types::COverridableVar(*VEC, Types::PRIORITY_WINDOW_RULE);
                     if (*PCLAMP_TILED || m_window->m_isFloating)
                         m_window->clampWindowSize(m_minSize.first.value(), std::nullopt);
                 } catch (std::exception& e) { Log::logger->log(Log::ERR, "minsize rule \"{}\" failed with: {}", effect, e.what()); }
@@ -626,5 +634,5 @@ void CWindowRuleApplicator::propertiesChanged(std::underlying_type_t<eRuleProper
         g_pDecorationPositioner->forceRecalcFor(m_window.lock());
 
     // for plugins
-    EMIT_HOOK_EVENT("windowUpdateRules", m_window.lock());
+    Event::bus()->m_events.window.updateRules.emit(m_window.lock());
 }

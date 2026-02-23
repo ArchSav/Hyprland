@@ -10,9 +10,9 @@
 #include "core/Compositor.hpp"
 #include "types/DMABuffer.hpp"
 #include "types/WLBuffer.hpp"
-#include "../managers/HookSystemManager.hpp"
 #include "../render/OpenGL.hpp"
 #include "../Compositor.hpp"
+#include "../event/EventBus.hpp"
 
 using namespace Hyprutils::OS;
 
@@ -26,6 +26,8 @@ static std::optional<dev_t> devIDFromFD(int fd) {
 CDMABUFFormatTable::CDMABUFFormatTable(SDMABUFTranche _rendererTranche, std::vector<std::pair<PHLMONITORREF, SDMABUFTranche>> tranches_) :
     m_rendererTranche(_rendererTranche), m_monitorTranches(tranches_) {
 
+    static const auto                       PSKIP_NON_KMS = CConfigValue<Hyprlang::INT>("quirks:skip_non_kms_dmabuf_formats");
+
     std::vector<SDMABUFFormatTableEntry>    formatsVec;
     std::set<std::pair<uint32_t, uint64_t>> formats;
 
@@ -35,6 +37,17 @@ CDMABUFFormatTable::CDMABUFFormatTable(SDMABUFTranche _rendererTranche, std::vec
     m_rendererTranche.indices.clear();
     for (auto const& fmt : m_rendererTranche.formats) {
         for (auto const& mod : fmt.modifiers) {
+            LOGM(Log::TRACE, "Render format 0x{:x} ({}) with mod 0x{:x} ({})", fmt.drmFormat, NFormatUtils::drmFormatName(fmt.drmFormat), mod, NFormatUtils::drmModifierName(mod));
+            if (*PSKIP_NON_KMS && !m_monitorTranches.empty()) {
+                if (std::ranges::none_of(m_monitorTranches, [fmt, mod](const std::pair<PHLMONITORREF, SDMABUFTranche>& pair) {
+                        return std::ranges::any_of(pair.second.formats, [fmt, mod](const SDRMFormat& format) {
+                            return format.drmFormat == fmt.drmFormat && std::ranges::any_of(format.modifiers, [mod](uint64_t modifier) { return mod == modifier; });
+                        });
+                    })) {
+                    LOGM(Log::TRACE, "    skipped");
+                    continue;
+                }
+            }
             auto format        = std::make_pair<>(fmt.drmFormat, mod);
             auto [_, inserted] = formats.insert(format);
             if (inserted) {
@@ -56,6 +69,9 @@ CDMABUFFormatTable::CDMABUFFormatTable(SDMABUFTranche _rendererTranche, std::vec
         tranche.indices.clear();
         for (auto const& fmt : tranche.formats) {
             for (auto const& mod : fmt.modifiers) {
+                LOGM(Log::TRACE, "[DMA] Monitor format 0x{:x} ({}) with mod 0x{:x} ({})", fmt.drmFormat, NFormatUtils::drmFormatName(fmt.drmFormat), mod,
+                     NFormatUtils::drmModifierName(mod));
+                // FIXME: recheck this. DRM_FORMAT_MOD_INVALID is allowed by the proto "For legacy support". DRM_FORMAT_MOD_LINEAR should be the most compatible mod
                 // apparently these can implode on planes, so don't use them
                 if (mod == DRM_FORMAT_MOD_INVALID || mod == DRM_FORMAT_MOD_LINEAR)
                     continue;
@@ -147,10 +163,17 @@ CLinuxDMABUFParamsResource::CLinuxDMABUFParamsResource(UP<CZwpLinuxBufferParamsV
             return;
         }
 
+        const uint64_t modifier = (sc<uint64_t>(modHi) << 32) | modLo;
+
+        if (m_resource->version() >= 5 && m_attrs->modifier && m_attrs->modifier != modifier) {
+            r->error(ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_FORMAT, "planes have different modifiers");
+            return;
+        }
+
         m_attrs->fds[plane]     = fd;
         m_attrs->strides[plane] = stride;
         m_attrs->offsets[plane] = offset;
-        m_attrs->modifier       = (sc<uint64_t>(modHi) << 32) | modLo;
+        m_attrs->modifier       = modifier;
     });
 
     m_resource->setCreate([this](CZwpLinuxBufferParamsV1* r, int32_t w, int32_t h, uint32_t fmt, zwpLinuxBufferParamsV1Flags flags) {
@@ -162,6 +185,13 @@ CLinuxDMABUFParamsResource::CLinuxDMABUFParamsResource(UP<CZwpLinuxBufferParamsV
         if (flags > 0) {
             r->sendFailed();
             LOGM(Log::ERR, "DMABUF flags are not supported");
+            return;
+        }
+
+        if (m_resource->version() >= 4 && std::ranges::none_of(PROTO::linuxDma->m_formatTable->m_rendererTranche.formats, [this, fmt](const auto format) {
+                return format.drmFormat == fmt && std::ranges::any_of(format.modifiers, [this](const auto mod) { return !mod || mod == m_attrs->modifier; });
+            })) {
+            r->error(ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_FORMAT, "format + modifier pair is not supported");
             return;
         }
 
@@ -382,8 +412,7 @@ CLinuxDMABUFResource::CLinuxDMABUFResource(UP<CZwpLinuxDmabufV1>&& resource_) : 
         }
     });
 
-    if (m_resource->version() < 4)
-        sendMods();
+    sendMods();
 }
 
 bool CLinuxDMABUFResource::good() {
@@ -392,22 +421,20 @@ bool CLinuxDMABUFResource::good() {
 
 void CLinuxDMABUFResource::sendMods() {
     for (auto const& fmt : PROTO::linuxDma->m_formatTable->m_rendererTranche.formats) {
-        for (auto const& mod : fmt.modifiers) {
-            if (m_resource->version() < 3) {
-                if (mod == DRM_FORMAT_MOD_INVALID || mod == DRM_FORMAT_MOD_LINEAR)
-                    m_resource->sendFormat(fmt.drmFormat);
-                continue;
+        m_resource->sendFormat(fmt.drmFormat);
+
+        if (m_resource->version() == 3) {
+            for (auto const& mod : fmt.modifiers) {
+                // TODO: https://gitlab.freedesktop.org/xorg/xserver/-/issues/1166
+
+                m_resource->sendModifier(fmt.drmFormat, mod >> 32, mod & 0xFFFFFFFF);
             }
-
-            // TODO: https://gitlab.freedesktop.org/xorg/xserver/-/issues/1166
-
-            m_resource->sendModifier(fmt.drmFormat, mod >> 32, mod & 0xFFFFFFFF);
         }
     }
 }
 
 CLinuxDMABufV1Protocol::CLinuxDMABufV1Protocol(const wl_interface* iface, const int& ver, const std::string& name) : IWaylandProtocol(iface, ver, name) {
-    static auto P = g_pHookSystem->hookDynamic("ready", [this](void* self, SCallbackInfo& info, std::any d) {
+    static auto P = Event::bus()->m_events.ready.listen([this] {
         int  rendererFD = g_pCompositor->m_drmRenderNode.fd >= 0 ? g_pCompositor->m_drmRenderNode.fd : g_pCompositor->m_drm.fd;
         auto dev        = devIDFromFD(rendererFD);
 
@@ -440,21 +467,28 @@ CLinuxDMABufV1Protocol::CLinuxDMABufV1Protocol(const wl_interface* iface, const 
                 tches.emplace_back(std::make_pair<>(mon, tranche));
             }
 
-            static auto monitorAdded = g_pHookSystem->hookDynamic("monitorAdded", [this](void* self, SCallbackInfo& info, std::any param) {
-                auto pMonitor = std::any_cast<PHLMONITOR>(param);
-                auto tranche  = SDMABUFTranche{
-                     .device  = m_mainDevice,
-                     .flags   = ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT,
-                     .formats = pMonitor->m_output->getRenderFormats(),
+            static auto monitorAdded = Event::bus()->m_events.monitor.added.listen([this](PHLMONITOR mon) {
+                auto tranche = SDMABUFTranche{
+                    .device  = m_mainDevice,
+                    .flags   = ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT,
+                    .formats = mon->m_output->getRenderFormats(),
                 };
-                m_formatTable->m_monitorTranches.emplace_back(std::make_pair<>(pMonitor, tranche));
+                m_formatTable->m_monitorTranches.emplace_back(std::make_pair<>(mon, tranche));
                 resetFormatTable();
             });
 
-            static auto monitorRemoved = g_pHookSystem->hookDynamic("monitorRemoved", [this](void* self, SCallbackInfo& info, std::any param) {
-                auto pMonitor = std::any_cast<PHLMONITOR>(param);
-                std::erase_if(m_formatTable->m_monitorTranches, [pMonitor](std::pair<PHLMONITORREF, SDMABUFTranche> pair) { return pair.first == pMonitor; });
+            static auto monitorRemoved = Event::bus()->m_events.monitor.removed.listen([this](PHLMONITOR mon) {
+                std::erase_if(m_formatTable->m_monitorTranches, [mon](std::pair<PHLMONITORREF, SDMABUFTranche> pair) { return pair.first == mon; });
                 resetFormatTable();
+            });
+
+            static auto configReloaded = Event::bus()->m_events.config.reloaded.listen([this] {
+                static const auto PSKIP_NON_KMS = CConfigValue<Hyprlang::INT>("quirks:skip_non_kms_dmabuf_formats");
+                static auto       prev          = *PSKIP_NON_KMS;
+                if (prev != *PSKIP_NON_KMS) {
+                    prev = *PSKIP_NON_KMS;
+                    resetFormatTable();
+                }
             });
         }
 
@@ -606,4 +640,8 @@ void CLinuxDMABufV1Protocol::updateScanoutTranche(SP<CWLSurfaceResource> surface
     feedbackResource->m_resource->sendDone();
 
     feedbackResource->m_lastFeedbackWasScanout = true;
+}
+
+dev_t CLinuxDMABufV1Protocol::getMainDevice() {
+    return m_mainDevice;
 }

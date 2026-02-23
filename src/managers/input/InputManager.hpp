@@ -91,6 +91,7 @@ class CInputManager {
     void               onMouseWarp(IPointer::SMotionAbsoluteEvent);
     void               onMouseButton(IPointer::SButtonEvent, SP<IPointer>);
     void               onMouseWheel(IPointer::SAxisEvent, SP<IPointer> pointer = nullptr);
+    void               onPointerFrame();
     void               onKeyboardKey(const IKeyboard::SKeyEvent&, SP<IKeyboard>);
     void               onKeyboardMod(SP<IKeyboard>);
 
@@ -152,12 +153,6 @@ class CInputManager {
     void               onTabletButton(CTablet::SButtonEvent);
 
     STouchData         m_touchData;
-
-    // for dragging floating windows
-    PHLWINDOWREF   m_currentlyDraggedWindow;
-    eMouseBindMode m_dragMode             = MBIND_INVALID;
-    bool           m_wasDraggingWindow    = false;
-    bool           m_dragThresholdReached = false;
 
     // for refocus to be forced
     PHLWINDOWREF                 m_forcedFocus;
@@ -299,6 +294,7 @@ class CInputManager {
         uint32_t lastEventTime     = 0;
         uint32_t accumulatedScroll = 0;
     } m_scrollWheelState;
+    bool                  m_pointerAxisFramePending = false;
 
     bool                  shareKeyFromAllKBs(uint32_t key, bool pressed);
     uint32_t              shareModsFromAllKBs(uint32_t depressed);

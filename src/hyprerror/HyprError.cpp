@@ -6,8 +6,8 @@
 #include "../render/pass/TexPassElement.hpp"
 #include "../managers/animation/AnimationManager.hpp"
 #include "../render/Renderer.hpp"
-#include "../managers/HookSystemManager.hpp"
 #include "../desktop/state/FocusState.hpp"
+#include "../event/EventBus.hpp"
 
 #include <hyprutils/utils/ScopeGuard.hpp>
 using namespace Hyprutils::Animation;
@@ -15,7 +15,7 @@ using namespace Hyprutils::Animation;
 CHyprError::CHyprError() {
     g_pAnimationManager->createAnimation(0.f, m_fadeOpacity, g_pConfigManager->getAnimationPropertyConfig("fadeIn"), AVARDAMAGE_NONE);
 
-    static auto P = g_pHookSystem->hookDynamic("focusedMon", [&](void* self, SCallbackInfo& info, std::any param) {
+    static auto P = Event::bus()->m_events.monitor.focused.listen([&](PHLMONITOR mon) {
         if (!m_isCreated)
             return;
 
@@ -23,7 +23,7 @@ CHyprError::CHyprError() {
         m_monitorChanged = true;
     });
 
-    static auto P2 = g_pHookSystem->hookDynamic("preRender", [&](void* self, SCallbackInfo& info, std::any param) {
+    static auto P2 = Event::bus()->m_events.render.pre.listen([&](PHLMONITOR mon) {
         if (!m_isCreated)
             return;
 
@@ -168,7 +168,8 @@ void CHyprError::createQueued() {
         m->m_reservedArea.resetType(Desktop::RESERVED_DYNAMIC_TYPE_ERROR_BAR);
     }
 
-    PMONITOR->m_reservedArea.addType(Desktop::RESERVED_DYNAMIC_TYPE_ERROR_BAR, Vector2D{0.0, *BAR_POSITION == 0 ? HEIGHT : 0.0}, Vector2D{0.0, *BAR_POSITION != 0 ? HEIGHT : 0.0});
+    const auto RESERVED = (HEIGHT + PAD) / SCALE;
+    PMONITOR->m_reservedArea.addType(Desktop::RESERVED_DYNAMIC_TYPE_ERROR_BAR, Vector2D{0.0, TOPBAR ? RESERVED : 0.0}, Vector2D{0.0, !TOPBAR ? RESERVED : 0.0});
 
     for (const auto& m : g_pCompositor->m_monitors) {
         g_pHyprRenderer->arrangeLayersForMonitor(m->m_id);
@@ -192,6 +193,7 @@ void CHyprError::draw() {
 
                 for (auto& m : g_pCompositor->m_monitors) {
                     g_pHyprRenderer->arrangeLayersForMonitor(m->m_id);
+                    m->m_reservedArea.resetType(Desktop::RESERVED_DYNAMIC_TYPE_ERROR_BAR);
                 }
 
                 return;

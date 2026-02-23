@@ -55,7 +55,16 @@ void CRenderPass::simplify() {
         auto opaque = el->element->opaqueRegion();
 
         if (!opaque.empty()) {
-            opaque.scale(g_pHyprOpenGL->m_renderData.pMonitor->m_scale);
+            // scale and rounding is very particular so we have to use CBoxes scale and round functions
+            if (opaque.getRects().size() == 1)
+                opaque = opaque.getExtents().scale(g_pHyprOpenGL->m_renderData.pMonitor->m_scale).round();
+            else {
+                CRegion scaledRegion;
+                opaque.forEachRect([&scaledRegion](const auto& RECT) {
+                    scaledRegion.add(CBox(RECT.x1, RECT.y1, RECT.x2 - RECT.x1, RECT.y2 - RECT.y1).scale(g_pHyprOpenGL->m_renderData.pMonitor->m_scale).round());
+                });
+                opaque = scaledRegion;
+            }
 
             // if this intersects the liveBlur region, allow live blur to operate correctly.
             // do not occlude a border near it.
@@ -162,7 +171,7 @@ CRegion CRenderPass::render(const CRegion& damage_) {
     } else
         g_pHyprOpenGL->m_renderData.finalDamage = m_damage;
 
-    if (std::ranges::any_of(m_passElements, [](const auto& el) { return el->element->disableSimplification(); })) {
+    if (g_pHyprOpenGL->m_renderData.noSimplify || std::ranges::any_of(m_passElements, [](const auto& el) { return el->element->disableSimplification(); })) {
         for (auto& el : m_passElements) {
             el->elementDamage = m_damage;
         }

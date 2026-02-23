@@ -22,16 +22,19 @@
 #include "../protocols/core/DataDevice.hpp"
 #include "../render/Renderer.hpp"
 #include "../managers/EventManager.hpp"
-#include "../managers/LayoutManager.hpp"
+#include "../managers/screenshare/ScreenshareManager.hpp"
 #include "../managers/animation/AnimationManager.hpp"
 #include "../managers/animation/DesktopAnimationManager.hpp"
 #include "../managers/input/InputManager.hpp"
 #include "../hyprerror/HyprError.hpp"
+#include "../layout/LayoutManager.hpp"
 #include "../i18n/Engine.hpp"
 #include "sync/SyncTimeline.hpp"
 #include "time/Time.hpp"
 #include "../desktop/view/LayerSurface.hpp"
 #include "../desktop/state/FocusState.hpp"
+#include "../event/EventBus.hpp"
+#include "Drm.hpp"
 #include <aquamarine/output/Output.hpp>
 #include "debug/log/Logger.hpp"
 #include "debug/HyprNotificationOverlay.hpp"
@@ -71,7 +74,7 @@ CMonitor::~CMonitor() {
 }
 
 void CMonitor::onConnect(bool noRule) {
-    EMIT_HOOK_EVENT("preMonitorAdded", m_self.lock());
+    Event::bus()->m_events.monitor.preAdded.emit(m_self.lock());
     CScopeGuard x = {[]() { g_pCompositor->arrangeMonitors(); }};
 
     m_zoomAnimProgress->setValueAndWarp(0.F);
@@ -84,10 +87,11 @@ void CMonitor::onConnect(bool noRule) {
             m_frameScheduler->onFrame();
     });
     m_listeners.commit     = m_output->events.commit.listen([this] {
-        if (true) { // FIXME: E->state->committed & WLR_OUTPUT_STATE_BUFFER
-            PROTO::screencopy->onOutputCommit(m_self.lock());
-            PROTO::toplevelExport->onOutputCommit(m_self.lock());
-        }
+        m_events.commit.emit();
+
+        // FIXME: E->state->committed & WLR_OUTPUT_STATE_BUFFER
+        if (true && Screenshare::mgr())
+            Screenshare::mgr()->onOutputCommit(m_self.lock());
     });
     m_listeners.needsFrame = m_output->events.needsFrame.listen([this] { g_pCompositor->scheduleFrameForMonitor(m_self.lock(), Aquamarine::IOutput::AQ_SCHEDULE_NEEDS_FRAME); });
 
@@ -114,10 +118,12 @@ void CMonitor::onConnect(bool noRule) {
             ts = nullptr;
         }
 
-        if (!ts)
-            PROTO::presentation->onPresented(m_self.lock(), Time::steadyNow(), event.refresh, event.seq, event.flags);
-        else
-            PROTO::presentation->onPresented(m_self.lock(), Time::fromTimespec(event.when), event.refresh, event.seq, event.flags);
+        if (!ts) {
+            timespec mono{};
+            clock_gettime(CLOCK_MONOTONIC, &mono);
+            PROTO::presentation->onPresented(m_self.lock(), mono, event.refresh, event.seq, event.flags & ~Aquamarine::IOutput::AQ_OUTPUT_PRESENT_HW_CLOCK);
+        } else
+            PROTO::presentation->onPresented(m_self.lock(), *ts, event.refresh, event.seq, event.flags);
 
         if (m_zoomAnimFrameCounter < 5) {
             m_zoomAnimFrameCounter++;
@@ -303,7 +309,7 @@ void CMonitor::onConnect(bool noRule) {
         Desktop::focusState()->rawMonitorFocus(m_self.lock());
 
     g_pHyprRenderer->arrangeLayersForMonitor(m_id);
-    g_pLayoutManager->getCurrentLayout()->recalculateMonitor(m_id);
+    g_layoutManager->recalculateMonitor(m_self.lock());
 
     // ensure VRR (will enable if necessary)
     g_pConfigManager->ensureVRR(m_self.lock());
@@ -341,17 +347,17 @@ void CMonitor::onConnect(bool noRule) {
 
     g_pEventManager->postEvent(SHyprIPCEvent{"monitoradded", m_name});
     g_pEventManager->postEvent(SHyprIPCEvent{"monitoraddedv2", std::format("{},{},{}", m_id, m_name, m_shortDescription)});
-    EMIT_HOOK_EVENT("monitorAdded", m_self.lock());
+    Event::bus()->m_events.monitor.added.emit(m_self.lock());
 }
 
 void CMonitor::onDisconnect(bool destroy) {
-    EMIT_HOOK_EVENT("preMonitorRemoved", m_self.lock());
+    Event::bus()->m_events.monitor.preRemoved.emit(m_self.lock());
     CScopeGuard x = {[this]() {
         if (g_pCompositor->m_isShuttingDown)
             return;
         g_pEventManager->postEvent(SHyprIPCEvent{"monitorremoved", m_name});
         g_pEventManager->postEvent(SHyprIPCEvent{"monitorremovedv2", std::format("{},{},{}", m_id, m_name, m_shortDescription)});
-        EMIT_HOOK_EVENT("monitorRemoved", m_self.lock());
+        Event::bus()->m_events.monitor.removed.emit(m_self.lock());
         g_pCompositor->scheduleMonitorStateRecheck();
     }};
 
@@ -411,7 +417,6 @@ void CMonitor::onDisconnect(bool destroy) {
         m_layerSurfaceLayers[i].clear();
     }
 
-    std::erase_if(g_pCompositor->m_monitors, [&](PHLMONITOR& el) { return el.get() == this; });
     Log::logger->log(Log::DEBUG, "Removed monitor {}!", m_name);
 
     if (!BACKUPMON) {
@@ -463,7 +468,7 @@ void CMonitor::onDisconnect(bool destroy) {
         PHLMONITOR pMonitorMostHz = nullptr;
 
         for (auto const& m : g_pCompositor->m_monitors) {
-            if (m->m_refreshRate > mostHz) {
+            if (m->m_refreshRate > mostHz && m != m_self) {
                 pMonitorMostHz = m;
                 mostHz         = m->m_refreshRate;
             }
@@ -471,6 +476,8 @@ void CMonitor::onDisconnect(bool destroy) {
 
         g_pHyprRenderer->m_mostHzMonitor = pMonitorMostHz;
     }
+
+    std::erase_if(g_pCompositor->m_monitors, [&](PHLMONITOR& el) { return el.get() == this; });
 }
 
 void CMonitor::applyCMType(NCMType::eCMType cmType, int cmSdrEotf) {
@@ -1009,7 +1016,7 @@ bool CMonitor::applyMonitorRule(SMonitorRule* pMonitorRule, bool force) {
     Log::logger->log(Log::DEBUG, "Monitor {} data dump: res {:X}@{:.2f}Hz, scale {:.2f}, transform {}, pos {:X}, 10b {}", m_name, m_pixelSize, m_refreshRate, m_scale,
                      sc<int>(m_transform), m_position, sc<int>(m_enabled10bit));
 
-    EMIT_HOOK_EVENT("monitorLayoutChanged", nullptr);
+    Event::bus()->m_events.monitor.layoutChanged.emit();
 
     m_events.modeChanged.emit();
 
@@ -1043,8 +1050,10 @@ bool CMonitor::shouldSkipScheduleFrameOnMouseEvent() {
     static auto PMINRR   = CConfigValue<Hyprlang::INT>("cursor:min_refresh_rate");
 
     // skip scheduling extra frames for fullsreen apps with vrr
-    const auto FS_WINDOW  = getFullscreenWindow();
-    const bool shouldSkip = FS_WINDOW && (*PNOBREAK == 1 || (*PNOBREAK == 2 && FS_WINDOW->getContentType() == CONTENT_TYPE_GAME)) && m_output->state->state().adaptiveSync;
+    const auto FS_WINDOW          = getFullscreenWindow();
+    const bool shouldRenderCursor = g_pHyprRenderer->shouldRenderCursor();
+    const bool noBreak            = FS_WINDOW && (*PNOBREAK == 1 || (*PNOBREAK == 2 && FS_WINDOW->getContentType() == CONTENT_TYPE_GAME));
+    const bool shouldSkip         = (!shouldRenderCursor || noBreak) && m_output->state->state().adaptiveSync;
 
     // keep requested minimum refresh rate
     if (shouldSkip && *PMINRR && m_lastPresentationTimer.getMillis() > 1000.0f / *PMINRR) {
@@ -1113,7 +1122,7 @@ void CMonitor::setupDefaultWS(const SMonitorRule& monitorRule) {
         // workspace exists, move it to the newly connected monitor
         g_pCompositor->moveWorkspaceToMonitor(PNEWWORKSPACE, m_self.lock());
         m_activeWorkspace = PNEWWORKSPACE;
-        g_pLayoutManager->getCurrentLayout()->recalculateMonitor(m_id);
+        g_layoutManager->recalculateMonitor(m_self.lock());
         g_pDesktopAnimationManager->startAnimation(PNEWWORKSPACE, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
     } else {
         if (newDefaultWorkspaceName.empty())
@@ -1317,17 +1326,17 @@ void CMonitor::changeWorkspace(const PHLWORKSPACE& pWorkspace, bool internal, bo
                     pWindow = pWorkspace->getFirstWindow();
             }
 
-            Desktop::focusState()->fullWindowFocus(pWindow);
+            Desktop::focusState()->fullWindowFocus(pWindow, Desktop::FOCUS_REASON_KEYBIND);
         }
 
         if (!noMouseMove)
             g_pInputManager->simulateMouseMovement();
 
-        g_pLayoutManager->getCurrentLayout()->recalculateMonitor(m_id);
+        g_layoutManager->recalculateMonitor(m_self.lock());
 
         g_pEventManager->postEvent(SHyprIPCEvent{"workspace", pWorkspace->m_name});
         g_pEventManager->postEvent(SHyprIPCEvent{"workspacev2", std::format("{},{}", pWorkspace->m_id, pWorkspace->m_name)});
-        EMIT_HOOK_EVENT("workspace", pWorkspace);
+        Event::bus()->m_events.workspace.active.emit(pWorkspace);
     }
 
     // set all LSes as not above fullscreen on workspace changes
@@ -1386,11 +1395,11 @@ void CMonitor::setSpecialWorkspace(const PHLWORKSPACE& pWorkspace) {
         if (POLDSPECIAL)
             POLDSPECIAL->m_events.activeChanged.emit();
 
-        g_pLayoutManager->getCurrentLayout()->recalculateMonitor(m_id);
+        g_layoutManager->recalculateMonitor(m_self.lock());
 
         if (!(Desktop::focusState()->window() && Desktop::focusState()->window()->m_pinned && Desktop::focusState()->window()->m_monitor == m_self)) {
             if (const auto PLAST = m_activeWorkspace->getLastFocusedWindow(); PLAST)
-                Desktop::focusState()->fullWindowFocus(PLAST);
+                Desktop::focusState()->fullWindowFocus(PLAST, Desktop::FOCUS_REASON_KEYBIND);
             else
                 g_pInputManager->refocus();
         }
@@ -1415,7 +1424,7 @@ void CMonitor::setSpecialWorkspace(const PHLWORKSPACE& pWorkspace) {
     const auto PMONITORWORKSPACEOWNER = pWorkspace->m_monitor.lock();
     if (const auto PMWSOWNER = pWorkspace->m_monitor.lock(); PMWSOWNER && PMWSOWNER->m_activeSpecialWorkspace == pWorkspace) {
         PMWSOWNER->m_activeSpecialWorkspace.reset();
-        g_pLayoutManager->getCurrentLayout()->recalculateMonitor(PMWSOWNER->m_id);
+        g_layoutManager->recalculateMonitor(PMWSOWNER);
         g_pEventManager->postEvent(SHyprIPCEvent{"activespecial", "," + PMWSOWNER->m_name});
         g_pEventManager->postEvent(SHyprIPCEvent{"activespecialv2", ",," + PMWSOWNER->m_name});
 
@@ -1474,17 +1483,16 @@ void CMonitor::setSpecialWorkspace(const PHLWORKSPACE& pWorkspace) {
                 } else
                     pos = pos - PMONFROMMIDDLE->m_position + m_position;
 
-                *w->m_realPosition = pos;
-                w->m_position      = pos;
+                w->layoutTarget()->setPositionGlobal(CBox{pos, w->layoutTarget()->position().size()});
             }
         }
     }
 
-    g_pLayoutManager->getCurrentLayout()->recalculateMonitor(m_id);
+    g_layoutManager->recalculateMonitor(m_self.lock());
 
     if (!(Desktop::focusState()->window() && Desktop::focusState()->window()->m_pinned && Desktop::focusState()->window()->m_monitor == m_self)) {
         if (const auto PLAST = pWorkspace->getLastFocusedWindow(); PLAST)
-            Desktop::focusState()->fullWindowFocus(PLAST);
+            Desktop::focusState()->fullWindowFocus(PLAST, Desktop::FOCUS_REASON_KEYBIND);
         else
             g_pInputManager->refocus();
     }
@@ -1721,6 +1729,10 @@ uint8_t CMonitor::isTearingBlocked(bool full) {
         }
     }
 
+    // TODO: remove this when kernel allows tearing + hw cursor updated
+    if (g_pPointerManager->hasVisibleHWCursor(m_self.lock()))
+        reasons |= TC_HW_CURSOR;
+
     if (m_solitaryClient.expired()) {
         reasons |= TC_CANDIDATE;
         return reasons;
@@ -1760,12 +1772,6 @@ uint16_t CMonitor::isDSBlocked(bool full) {
             if (!full)
                 return reasons;
         }
-    }
-
-    if (m_tearingState.activelyTearing) {
-        reasons |= DS_BLOCK_TEARING;
-        if (!full)
-            return reasons;
     }
 
     if (!m_mirrors.empty() || isMirror()) {
@@ -1812,15 +1818,21 @@ uint16_t CMonitor::isDSBlocked(bool full) {
             return reasons;
     }
 
-    const bool surfaceIsHDR = PSURFACE->m_colorManagement.valid() && (PSURFACE->m_colorManagement->isHDR() || PSURFACE->m_colorManagement->isWindowsScRGB());
-    if (needsCM() && *PNONSHADER != CM_NS_IGNORE && !canNoShaderCM() && ((inHDR() && (*PPASS == 0 || !surfaceIsHDR)) || (!inHDR() && (*PPASS != 1 || surfaceIsHDR))))
+    const bool surfaceIsHDR   = PSURFACE->m_colorManagement.valid() && PSURFACE->m_colorManagement->isHDR();
+    const bool surfaceIsScRGB = surfaceIsHDR && PSURFACE->m_colorManagement->isWindowsScRGB();
+
+    if (needsCM() && (*PNONSHADER != CM_NS_IGNORE || surfaceIsScRGB) && !canNoShaderCM() &&
+        ((inHDR() && (*PPASS == 0 || !surfaceIsHDR || surfaceIsScRGB)) || (!inHDR() && (*PPASS != 1 || surfaceIsHDR))))
         reasons |= DS_BLOCK_CM;
 
     return reasons;
 }
 
 bool CMonitor::attemptDirectScanout() {
-    const auto blockedReason = isDSBlocked();
+    static const auto PSAME     = CConfigValue<Hyprlang::INT>("debug:ds_handle_same_buffer");
+    static const auto PSAMEFIFO = CConfigValue<Hyprlang::INT>("debug:ds_handle_same_buffer_fifo");
+
+    const auto        blockedReason = isDSBlocked();
     if (blockedReason)
         return false;
 
@@ -1834,7 +1846,7 @@ bool CMonitor::attemptDirectScanout() {
     auto PBUFFER = PSURFACE->m_current.buffer.m_buffer;
 
     // #TODO this entire bit needs figuring out, vrr goes down the drain without it
-    if (PBUFFER == m_output->state->state().buffer) {
+    if (PBUFFER == m_output->state->state().buffer && *PSAME) {
         PSURFACE->presentFeedback(Time::steadyNow(), m_self.lock());
 
         if (m_scanoutNeedsCursorUpdate) {
@@ -1853,7 +1865,7 @@ bool CMonitor::attemptDirectScanout() {
         }
 
         //#TODO this entire bit is bootleg deluxe, above bit is to not make vrr go down the drain, returning early here means fifo gets forever locked.
-        if (PSURFACE->m_fifo)
+        if (PSURFACE->m_fifo && !m_tearingState.activelyTearing && *PSAMEFIFO)
             PSURFACE->m_stateQueue.unlockFirst(LOCK_REASON_FIFO);
 
         return true;
@@ -1884,7 +1896,18 @@ bool CMonitor::attemptDirectScanout() {
     PSURFACE->presentFeedback(Time::steadyNow(), m_self.lock());
 
     m_output->state->addDamage(PSURFACE->m_current.accumulateBufferDamage());
-    m_output->state->resetExplicitFences();
+
+    // multigpu needs a fence to trigger fence syncing blits and also committing with the recreated dgpu fence
+    if (!DRM::sameGpu(m_output->getBackend()->preferredAllocator()->drmFD(), g_pCompositor->m_drm.fd) && g_pHyprOpenGL->explicitSyncSupported()) {
+        auto sync = CEGLSync::create();
+
+        if (sync->fd().isValid()) {
+            m_inFence = sync->takeFd();
+            m_output->state->setExplicitInFence(m_inFence.get());
+        } else
+            m_output->state->resetExplicitFences(); // good luck.
+    } else
+        m_output->state->resetExplicitFences();
 
     // no need to do explicit sync here as surface current can only ever be ready to read
 
@@ -2131,13 +2154,15 @@ bool CMonitor::canNoShaderCM() {
 
     static auto PSDREOTF = CConfigValue<Hyprlang::INT>("render:cm_sdr_eotf");
     // only primaries differ
-    return ((SRC_DESC_VALUE.transferFunction == m_imageDescription->value().transferFunction ||
-             (*PSDREOTF == 2 && SRC_DESC_VALUE.transferFunction == NColorManagement::CM_TRANSFER_FUNCTION_SRGB &&
-              m_imageDescription->value().transferFunction == NColorManagement::CM_TRANSFER_FUNCTION_GAMMA22)) &&
-            SRC_DESC_VALUE.transferFunctionPower == m_imageDescription->value().transferFunctionPower &&
-            (!inHDR() || SRC_DESC_VALUE.luminances == m_imageDescription->value().luminances) &&
-            SRC_DESC_VALUE.masteringLuminances == m_imageDescription->value().masteringLuminances && SRC_DESC_VALUE.maxCLL == m_imageDescription->value().maxCLL &&
-            SRC_DESC_VALUE.maxFALL == m_imageDescription->value().maxFALL);
+    return (
+        (SRC_DESC_VALUE.transferFunction == m_imageDescription->value().transferFunction ||
+         (*PSDREOTF == 2 && SRC_DESC_VALUE.transferFunction == NColorManagement::CM_TRANSFER_FUNCTION_SRGB &&
+          m_imageDescription->value().transferFunction == NColorManagement::CM_TRANSFER_FUNCTION_GAMMA22)) &&
+        SRC_DESC_VALUE.transferFunctionPower == m_imageDescription->value().transferFunctionPower &&
+        (!inHDR() || SRC_DESC_VALUE.luminances == m_imageDescription->value().luminances)
+        // not used by shaders atm
+        // && SRC_DESC_VALUE.masteringLuminances == m_imageDescription->value().masteringLuminances && SRC_DESC_VALUE.maxCLL == m_imageDescription->value().maxCLL && SRC_DESC_VALUE.maxFALL == m_imageDescription->value().maxFALL
+    );
 }
 
 bool CMonitor::doesNoShaderCM() {
@@ -2171,7 +2196,7 @@ bool CMonitorState::commit() {
     if (!updateSwapchain())
         return false;
 
-    EMIT_HOOK_EVENT("preMonitorCommit", m_owner->m_self.lock());
+    Event::bus()->m_events.monitor.preCommit.emit(m_owner->m_self.lock());
 
     ensureBufferPresent();
 

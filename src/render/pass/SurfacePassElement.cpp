@@ -5,6 +5,7 @@
 #include "../../protocols/core/Compositor.hpp"
 #include "../../protocols/DRMSyncobj.hpp"
 #include "../../managers/input/InputManager.hpp"
+#include "../../layout/LayoutManager.hpp"
 #include "../Renderer.hpp"
 
 #include <hyprutils/math/Box.hpp>
@@ -51,7 +52,7 @@ void CSurfacePassElement::draw(const CRegion& damage) {
     if (!TEXTURE->m_texID)
         return;
 
-    const auto INTERACTIVERESIZEINPROGRESS = m_data.pWindow && g_pInputManager->m_currentlyDraggedWindow && g_pInputManager->m_dragMode == MBIND_RESIZE;
+    const auto INTERACTIVERESIZEINPROGRESS = m_data.pWindow && g_layoutManager->dragController()->target() && g_layoutManager->dragController()->mode() == MBIND_RESIZE;
     TRACY_GPU_ZONE("RenderSurface");
 
     auto        PSURFACE = Desktop::View::CWLSurface::fromResource(m_data.surface);
@@ -103,7 +104,7 @@ void CSurfacePassElement::draw(const CRegion& damage) {
     }
 
     const bool WINDOWOPAQUE    = m_data.pWindow && m_data.pWindow->wlSurface()->resource() == m_data.surface ? m_data.pWindow->opaque() : false;
-    const bool CANDISABLEBLEND = ALPHA >= 1.f && OVERALL_ALPHA >= 1.f && rounding == 0 && WINDOWOPAQUE;
+    const bool CANDISABLEBLEND = ALPHA >= 1.f && OVERALL_ALPHA >= 1.f && rounding <= 0 && WINDOWOPAQUE;
 
     if (CANDISABLEBLEND)
         g_pHyprOpenGL->blend(false);
@@ -163,7 +164,7 @@ void CSurfacePassElement::draw(const CRegion& damage) {
 CBox CSurfacePassElement::getTexBox() {
     const double outputX = -m_data.pMonitor->m_position.x, outputY = -m_data.pMonitor->m_position.y;
 
-    const auto   INTERACTIVERESIZEINPROGRESS = m_data.pWindow && g_pInputManager->m_currentlyDraggedWindow && g_pInputManager->m_dragMode == MBIND_RESIZE;
+    const auto   INTERACTIVERESIZEINPROGRESS = m_data.pWindow && g_layoutManager->dragController()->target() && g_layoutManager->dragController()->mode() == MBIND_RESIZE;
     auto         PSURFACE                    = Desktop::View::CWLSurface::fromResource(m_data.surface);
 
     CBox         windowBox;

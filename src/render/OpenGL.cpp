@@ -19,7 +19,6 @@
 #include "../protocols/core/Compositor.hpp"
 #include "../protocols/ColorManagement.hpp"
 #include "../protocols/types/ColorManagement.hpp"
-#include "../managers/HookSystemManager.hpp"
 #include "../managers/input/InputManager.hpp"
 #include "../managers/eventLoop/EventLoopManager.hpp"
 #include "../managers/CursorManager.hpp"
@@ -27,6 +26,7 @@
 #include "../helpers/env/Env.hpp"
 #include "../helpers/MainLoopExecutor.hpp"
 #include "../i18n/Engine.hpp"
+#include "../event/EventBus.hpp"
 #include "debug/HyprNotificationOverlay.hpp"
 #include "hyprerror/HyprError.hpp"
 #include "pass/TexPassElement.hpp"
@@ -160,6 +160,7 @@ void CHyprOpenGLImpl::initEGL(bool gbm) {
     m_exts.EXT_create_context_robustness      = EGLEXTENSIONS.contains("EXT_create_context_robustness");
     m_exts.EXT_image_dma_buf_import           = EGLEXTENSIONS.contains("EXT_image_dma_buf_import");
     m_exts.EXT_image_dma_buf_import_modifiers = EGLEXTENSIONS.contains("EXT_image_dma_buf_import_modifiers");
+    m_exts.KHR_context_flush_control          = EGLEXTENSIONS.contains("EGL_KHR_context_flush_control");
 
     if (m_exts.IMG_context_priority) {
         Log::logger->log(Log::DEBUG, "EGL: IMG_context_priority supported, requesting high");
@@ -171,6 +172,12 @@ void CHyprOpenGLImpl::initEGL(bool gbm) {
         Log::logger->log(Log::DEBUG, "EGL: EXT_create_context_robustness supported, requesting lose on reset");
         attrs.push_back(EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT);
         attrs.push_back(EGL_LOSE_CONTEXT_ON_RESET_EXT);
+    }
+
+    if (m_exts.KHR_context_flush_control) {
+        Log::logger->log(Log::DEBUG, "EGL: Using KHR_context_flush_control");
+        attrs.push_back(EGL_CONTEXT_RELEASE_BEHAVIOR_KHR);
+        attrs.push_back(EGL_CONTEXT_RELEASE_BEHAVIOR_NONE_KHR); // or _FLUSH_KHR
     }
 
     auto attrsNoVer = attrs;
@@ -297,7 +304,8 @@ CHyprOpenGLImpl::CHyprOpenGLImpl() : m_drmFD(g_pCompositor->m_drmRenderNode.fd >
         loadGLProc(&m_proc.eglQueryDisplayAttribEXT, "eglQueryDisplayAttribEXT");
     }
 
-    if (EGLEXTENSIONS.contains("EGL_KHR_debug")) {
+    static const auto GLDEBUG = CConfigValue<Hyprlang::INT>("debug:gl_debugging");
+    if (EGLEXTENSIONS.contains("EGL_KHR_debug") && *GLDEBUG) {
         loadGLProc(&m_proc.eglDebugMessageControlKHR, "eglDebugMessageControlKHR");
         static const EGLAttrib debugAttrs[] = {
             EGL_DEBUG_MSG_CRITICAL_KHR, EGL_TRUE, EGL_DEBUG_MSG_ERROR_KHR, EGL_TRUE, EGL_DEBUG_MSG_WARN_KHR, EGL_TRUE, EGL_DEBUG_MSG_INFO_KHR, EGL_TRUE, EGL_NONE,
@@ -383,7 +391,7 @@ CHyprOpenGLImpl::CHyprOpenGLImpl() : m_drmFD(g_pCompositor->m_drmRenderNode.fd >
 
     initAssets();
 
-    static auto P = g_pHookSystem->hookDynamic("preRender", [&](void* self, SCallbackInfo& info, std::any data) { preRender(std::any_cast<PHLMONITOR>(data)); });
+    static auto P = Event::bus()->m_events.render.pre.listen([&](PHLMONITOR mon) { preRender(mon); });
 
     RASSERT(eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT), "Couldn't unset current EGL!");
 
@@ -414,23 +422,19 @@ CHyprOpenGLImpl::CHyprOpenGLImpl() : m_drmFD(g_pCompositor->m_drmRenderNode.fd >
 #endif
     };
 
-    static auto P2 = g_pHookSystem->hookDynamic("mouseButton", [](void* self, SCallbackInfo& info, std::any e) {
-        auto E = std::any_cast<IPointer::SButtonEvent>(e);
-
-        if (E.state != WL_POINTER_BUTTON_STATE_PRESSED)
+    static auto P2 = Event::bus()->m_events.input.mouse.button.listen([](IPointer::SButtonEvent e, Event::SCallbackInfo&) {
+        if (e.state != WL_POINTER_BUTTON_STATE_PRESSED)
             return;
 
         addLastPressToHistory(g_pInputManager->getMouseCoordsInternal(), g_pInputManager->getClickMode() == CLICKMODE_KILL, false);
     });
 
-    static auto P3 = g_pHookSystem->hookDynamic("touchDown", [](void* self, SCallbackInfo& info, std::any e) {
-        auto E = std::any_cast<ITouch::SDownEvent>(e);
-
-        auto PMONITOR = g_pCompositor->getMonitorFromName(!E.device->m_boundOutput.empty() ? E.device->m_boundOutput : "");
+    static auto P3 = Event::bus()->m_events.input.touch.down.listen([](ITouch::SDownEvent e, Event::SCallbackInfo&) {
+        auto PMONITOR = g_pCompositor->getMonitorFromName(!e.device->m_boundOutput.empty() ? e.device->m_boundOutput : "");
 
         PMONITOR = PMONITOR ? PMONITOR : Desktop::focusState()->monitor();
 
-        const auto TOUCH_COORDS = PMONITOR->m_position + (E.pos * PMONITOR->m_size);
+        const auto TOUCH_COORDS = PMONITOR->m_position + (e.pos * PMONITOR->m_size);
 
         addLastPressToHistory(TOUCH_COORDS, g_pInputManager->getClickMode() == CLICKMODE_KILL, true);
     });
@@ -677,6 +681,7 @@ void CHyprOpenGLImpl::beginSimple(PHLMONITOR pMonitor, const CRegion& damage, SP
     if (!m_shadersInitialized)
         initShaders();
 
+    m_renderData.transformDamage = true;
     m_renderData.damage.set(damage);
     m_renderData.finalDamage.set(damage);
 
@@ -744,6 +749,7 @@ void CHyprOpenGLImpl::begin(PHLMONITOR pMonitor, const CRegion& damage_, CFrameb
     if (m_renderData.pCurrentMonData->monitorMirrorFB.isAllocated() && m_renderData.pMonitor->m_mirrors.empty())
         m_renderData.pCurrentMonData->monitorMirrorFB.release();
 
+    m_renderData.transformDamage = true;
     m_renderData.damage.set(damage_);
     m_renderData.finalDamage.set(finalDamage.value_or(damage_));
 
@@ -831,11 +837,15 @@ void CHyprOpenGLImpl::end() {
     if UNLIKELY (m_renderData.pCurrentMonData->offMainFB.isAllocated())
         m_renderData.pCurrentMonData->offMainFB.release();
 
-    // check for gl errors
-    const GLenum ERR = glGetError();
+    static const auto GLDEBUG = CConfigValue<Hyprlang::INT>("debug:gl_debugging");
 
-    if UNLIKELY (ERR == GL_CONTEXT_LOST) /* We don't have infra to recover from this */
-        RASSERT(false, "glGetError at Opengl::end() returned GL_CONTEXT_LOST. Cannot continue until proper GPU reset handling is implemented.");
+    if (*GLDEBUG) {
+        // check for gl errors
+        const GLenum ERR = glGetError();
+
+        if UNLIKELY (ERR == GL_CONTEXT_LOST) /* We don't have infra to recover from this */
+            RASSERT(false, "glGetError at Opengl::end() returned GL_CONTEXT_LOST. Cannot continue until proper GPU reset handling is implemented.");
+    }
 }
 
 void CHyprOpenGLImpl::setDamage(const CRegion& damage_, std::optional<CRegion> finalDamage) {
@@ -871,21 +881,42 @@ static void processShaderIncludes(std::string& source, const std::map<std::strin
     }
 }
 
-static std::string processShader(const std::string& filename, const std::map<std::string, std::string>& includes) {
+static const uint8_t MAX_INCLUDE_DEPTH = 3;
+
+static std::string   processShader(const std::string& filename, const std::map<std::string, std::string>& includes, const uint8_t includeDepth = 1) {
     auto source = loadShader(filename);
-    processShaderIncludes(source, includes);
+    for (auto i = 0; i < includeDepth; i++) {
+        processShaderIncludes(source, includes);
+    }
     return source;
 }
 
 bool CHyprOpenGLImpl::initShaders() {
-    auto              shaders   = makeShared<SPreparedShaders>();
-    const bool        isDynamic = m_shadersInitialized;
-    static const auto PCM       = CConfigValue<Hyprlang::INT>("render:cm_enabled");
+    auto                               shaders = makeShared<SPreparedShaders>();
+    std::map<std::string, std::string> includes;
+    const bool                         isDynamic = m_shadersInitialized;
+    static const auto                  PCM       = CConfigValue<Hyprlang::INT>("render:cm_enabled");
 
     try {
-        std::map<std::string, std::string> includes;
+        loadShaderInclude("get_rgb_pixel.glsl", includes);
+        loadShaderInclude("get_rgba_pixel.glsl", includes);
+        loadShaderInclude("get_rgbx_pixel.glsl", includes);
+        loadShaderInclude("discard.glsl", includes);
+        loadShaderInclude("do_discard.glsl", includes);
+        loadShaderInclude("tint.glsl", includes);
+        loadShaderInclude("do_tint.glsl", includes);
         loadShaderInclude("rounding.glsl", includes);
+        loadShaderInclude("do_rounding.glsl", includes);
+        loadShaderInclude("surface_CM.glsl", includes);
         loadShaderInclude("CM.glsl", includes);
+        loadShaderInclude("do_CM.glsl", includes);
+        loadShaderInclude("tonemap.glsl", includes);
+        loadShaderInclude("do_tonemap.glsl", includes);
+        loadShaderInclude("sdr_mod.glsl", includes);
+        loadShaderInclude("do_sdr_mod.glsl", includes);
+        loadShaderInclude("primaries_xyz.glsl", includes);
+        loadShaderInclude("primaries_xyz_uniform.glsl", includes);
+        loadShaderInclude("primaries_xyz_const.glsl", includes);
         loadShaderInclude("gain.glsl", includes);
         loadShaderInclude("border.glsl", includes);
 
@@ -896,17 +927,13 @@ bool CHyprOpenGLImpl::initShaders() {
             m_cmSupported = false;
         else {
             std::vector<SFragShaderDesc> CM_SHADERS = {{
-                {SH_FRAG_CM_RGBA, "CMrgba.frag"},
-                {SH_FRAG_CM_RGBA_DISCARD, "CMrgbadiscard.frag"},
-                {SH_FRAG_CM_RGBX, "CMrgbx.frag"},
-                {SH_FRAG_CM_RGBX_DISCARD, "CMrgbadiscard.frag"},
                 {SH_FRAG_CM_BLURPREPARE, "CMblurprepare.frag"},
                 {SH_FRAG_CM_BORDER1, "CMborder.frag"},
             }};
 
             bool                         success = false;
             for (const auto& desc : CM_SHADERS) {
-                const auto fragSrc = processShader(desc.file, includes);
+                const auto fragSrc = processShader(desc.file, includes, MAX_INCLUDE_DEPTH);
 
                 if (!(success = shaders->frag[desc.id]->createProgram(shaders->TEXVERTSRC, fragSrc, true, true)))
                     break;
@@ -926,11 +953,9 @@ bool CHyprOpenGLImpl::initShaders() {
 
         std::vector<SFragShaderDesc> FRAG_SHADERS = {{
             {SH_FRAG_QUAD, "quad.frag"},
-            {SH_FRAG_RGBA, "rgba.frag"},
             {SH_FRAG_PASSTHRURGBA, "passthru.frag"},
             {SH_FRAG_MATTE, "rgbamatte.frag"},
             {SH_FRAG_GLITCH, "glitch.frag"},
-            {SH_FRAG_RGBX, "rgbx.frag"},
             {SH_FRAG_EXT, "ext.frag"},
             {SH_FRAG_BLUR1, "blur1.frag"},
             {SH_FRAG_BLUR2, "blur2.frag"},
@@ -941,7 +966,7 @@ bool CHyprOpenGLImpl::initShaders() {
         }};
 
         for (const auto& desc : FRAG_SHADERS) {
-            const auto fragSrc = processShader(desc.file, includes);
+            const auto fragSrc = processShader(desc.file, includes, MAX_INCLUDE_DEPTH);
 
             if (!shaders->frag[desc.id]->createProgram(shaders->TEXVERTSRC, fragSrc, isDynamic))
                 return false;
@@ -956,6 +981,7 @@ bool CHyprOpenGLImpl::initShaders() {
     }
 
     m_shaders            = shaders;
+    m_includes           = includes;
     m_shadersInitialized = true;
 
     Log::logger->log(Log::DEBUG, "Shaders initialized successfully.");
@@ -1031,7 +1057,7 @@ void CHyprOpenGLImpl::clear(const CHyprColor& color) {
 
     if (!m_renderData.damage.empty()) {
         m_renderData.damage.forEachRect([this](const auto& RECT) {
-            scissor(&RECT);
+            scissor(&RECT, m_renderData.transformDamage);
             glClear(GL_COLOR_BUFFER_BIT);
         });
     }
@@ -1166,13 +1192,13 @@ void CHyprOpenGLImpl::renderRectWithDamageInternal(const CBox& box, const CHyprC
 
         if (!damageClip.empty()) {
             damageClip.forEachRect([this](const auto& RECT) {
-                scissor(&RECT);
+                scissor(&RECT, m_renderData.transformDamage);
                 glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             });
         }
     } else {
         data.damage->forEachRect([this](const auto& RECT) {
-            scissor(&RECT);
+            scissor(&RECT, m_renderData.transformDamage);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         });
     }
@@ -1311,7 +1337,7 @@ void CHyprOpenGLImpl::renderTextureInternal(SP<CTexture> tex, const CBox& box, c
 
     const bool  CRASHING = m_applyFinalShader && g_pHyprRenderer->m_crashingInProgress;
 
-    auto        texType = tex->m_type;
+    uint8_t     shaderFeatures = 0;
 
     if (CRASHING) {
         shader           = m_shaders->frag[SH_FRAG_GLITCH];
@@ -1325,8 +1351,8 @@ void CHyprOpenGLImpl::renderTextureInternal(SP<CTexture> tex, const CBox& box, c
             usingFinalShader = true;
         } else {
             switch (tex->m_type) {
-                case TEXTURE_RGBA: shader = m_shaders->frag[SH_FRAG_RGBA]; break;
-                case TEXTURE_RGBX: shader = m_shaders->frag[SH_FRAG_RGBX]; break;
+                case TEXTURE_RGBA: shaderFeatures |= SH_FEAT_RGBA; break;
+                case TEXTURE_RGBX: shaderFeatures &= ~SH_FEAT_RGBA; break;
 
                 case TEXTURE_EXTERNAL: shader = m_shaders->frag[SH_FRAG_EXT]; break; // might be unused
                 default: RASSERT(false, "tex->m_iTarget unsupported!");
@@ -1334,10 +1360,8 @@ void CHyprOpenGLImpl::renderTextureInternal(SP<CTexture> tex, const CBox& box, c
         }
     }
 
-    if (m_renderData.currentWindow && m_renderData.currentWindow->m_ruleApplicator->RGBX().valueOrDefault()) {
-        shader  = m_shaders->frag[SH_FRAG_RGBX];
-        texType = TEXTURE_RGBX;
-    }
+    if (m_renderData.currentWindow && m_renderData.currentWindow->m_ruleApplicator->RGBX().valueOrDefault())
+        shaderFeatures &= ~SH_FEAT_RGBA;
 
     glActiveTexture(GL_TEXTURE0);
     tex->bind();
@@ -1349,47 +1373,72 @@ void CHyprOpenGLImpl::renderTextureInternal(SP<CTexture> tex, const CBox& box, c
         tex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         tex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     } else {
-        tex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        tex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        tex->setTexParameter(GL_TEXTURE_MAG_FILTER, tex->magFilter);
+        tex->setTexParameter(GL_TEXTURE_MIN_FILTER, tex->minFilter);
     }
 
-    const bool isHDRSurface      = m_renderData.surface.valid() && m_renderData.surface->m_colorManagement.valid() ? m_renderData.surface->m_colorManagement->isHDR() : false;
-    const bool canPassHDRSurface = isHDRSurface && !m_renderData.surface->m_colorManagement->isWindowsScRGB(); // windows scRGB requires CM shader
+    const bool  isHDRSurface      = m_renderData.surface.valid() && m_renderData.surface->m_colorManagement.valid() ? m_renderData.surface->m_colorManagement->isHDR() : false;
+    const bool  canPassHDRSurface = isHDRSurface && !m_renderData.surface->m_colorManagement->isWindowsScRGB(); // windows scRGB requires CM shader
 
-    const auto imageDescription = m_renderData.surface.valid() && m_renderData.surface->m_colorManagement.valid() ?
-        CImageDescription::from(m_renderData.surface->m_colorManagement->imageDescription()) :
-        (data.cmBackToSRGB ? data.cmBackToSRGBSource->m_imageDescription : DEFAULT_IMAGE_DESCRIPTION);
+    const auto  imageDescription = m_renderData.surface.valid() && m_renderData.surface->m_colorManagement.valid() ?
+         CImageDescription::from(m_renderData.surface->m_colorManagement->imageDescription()) :
+         (data.cmBackToSRGB ? data.cmBackToSRGBSource->m_imageDescription : DEFAULT_IMAGE_DESCRIPTION);
 
-    const bool skipCM = !*PENABLECM || !m_cmSupported                                                        /* CM unsupported or disabled */
-        || m_renderData.pMonitor->doesNoShaderCM()                                                           /* no shader needed */
-        || (imageDescription->id() == m_renderData.pMonitor->m_imageDescription->id() && !data.cmBackToSRGB) /* Source and target have the same image description */
+    static auto PSDREOTF      = CConfigValue<Hyprlang::INT>("render:cm_sdr_eotf");
+    auto        chosenSdrEotf = *PSDREOTF != 3 ? NColorManagement::CM_TRANSFER_FUNCTION_GAMMA22 : NColorManagement::CM_TRANSFER_FUNCTION_SRGB;
+    const auto  targetImageDescription =
+        data.cmBackToSRGB ? CImageDescription::from(NColorManagement::SImageDescription{.transferFunction = chosenSdrEotf}) : m_renderData.pMonitor->m_imageDescription;
+
+    const bool skipCM = !*PENABLECM || !m_cmSupported                                     /* CM unsupported or disabled */
+        || m_renderData.pMonitor->doesNoShaderCM()                                        /* no shader needed */
+        || (imageDescription->id() == targetImageDescription->id() && !data.cmBackToSRGB) /* Source and target have the same image description */
         || (((*PPASS && canPassHDRSurface) ||
              (*PPASS == 1 && !isHDRSurface && m_renderData.pMonitor->m_cmType != NCMType::CM_HDR && m_renderData.pMonitor->m_cmType != NCMType::CM_HDR_EDID)) &&
             m_renderData.pMonitor->inFullscreenMode()) /* Fullscreen window with pass cm enabled */;
 
-    if (!skipCM && !usingFinalShader) {
-        if (!data.discardActive) {
-            if (texType == TEXTURE_RGBA)
-                shader = m_shaders->frag[SH_FRAG_CM_RGBA];
-            else if (texType == TEXTURE_RGBX)
-                shader = m_shaders->frag[SH_FRAG_CM_RGBX];
-        } else {
-            if (texType == TEXTURE_RGBA)
-                shader = m_shaders->frag[SH_FRAG_CM_RGBA_DISCARD];
-            else if (texType == TEXTURE_RGBX)
-                shader = m_shaders->frag[SH_FRAG_CM_RGBA_DISCARD];
+    if (data.discardActive)
+        shaderFeatures |= SH_FEAT_DISCARD;
+
+    if (!usingFinalShader) {
+        if (data.allowDim && m_renderData.currentWindow && (m_renderData.currentWindow->m_notRespondingTint->value() > 0 || m_renderData.currentWindow->m_dimPercent->value() > 0))
+            shaderFeatures |= SH_FEAT_TINT;
+
+        if (data.round > 0)
+            shaderFeatures |= SH_FEAT_ROUNDING;
+
+        if (!skipCM) {
+            shaderFeatures |= SH_FEAT_CM;
+
+            const bool  needsSDRmod     = isSDR2HDR(imageDescription->value(), targetImageDescription->value());
+            const bool  needsHDRmod     = !needsSDRmod && isHDR2SDR(imageDescription->value(), targetImageDescription->value());
+            const float maxLuminance    = needsHDRmod ?
+                   imageDescription->value().getTFMaxLuminance(-1) :
+                   (imageDescription->value().luminances.max > 0 ? imageDescription->value().luminances.max : imageDescription->value().luminances.reference);
+            const auto  dstMaxLuminance = targetImageDescription->value().luminances.max > 0 ? targetImageDescription->value().luminances.max : 10000;
+
+            if (maxLuminance >= dstMaxLuminance * 1.01)
+                shaderFeatures |= SH_FEAT_TONEMAP;
+
+            if (!data.cmBackToSRGB &&
+                (imageDescription->value().transferFunction == CM_TRANSFER_FUNCTION_SRGB || imageDescription->value().transferFunction == CM_TRANSFER_FUNCTION_GAMMA22) &&
+                targetImageDescription->value().transferFunction == CM_TRANSFER_FUNCTION_ST2084_PQ &&
+                ((m_renderData.pMonitor->m_sdrSaturation > 0 && m_renderData.pMonitor->m_sdrSaturation != 1.0f) ||
+                 (m_renderData.pMonitor->m_sdrBrightness > 0 && m_renderData.pMonitor->m_sdrBrightness != 1.0f)))
+                shaderFeatures |= SH_FEAT_SDR_MOD;
         }
+    }
 
-        shader = useShader(shader);
+    if (!shader)
+        shader = getSurfaceShader(shaderFeatures);
 
-        if (data.cmBackToSRGB) {
-            static auto PSDREOTF      = CConfigValue<Hyprlang::INT>("render:cm_sdr_eotf");
-            auto        chosenSdrEotf = *PSDREOTF != 3 ? NColorManagement::CM_TRANSFER_FUNCTION_GAMMA22 : NColorManagement::CM_TRANSFER_FUNCTION_SRGB;
-            passCMUniforms(shader, imageDescription, CImageDescription::from(NColorManagement::SImageDescription{.transferFunction = chosenSdrEotf}), true, -1, -1);
-        } else
+    shader = useShader(shader);
+
+    if (!skipCM && !usingFinalShader) {
+        if (data.cmBackToSRGB)
+            passCMUniforms(shader, imageDescription, targetImageDescription, true, -1, -1);
+        else
             passCMUniforms(shader, imageDescription);
-    } else
-        shader = useShader(shader);
+    }
 
     shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
     shader->setUniformInt(SHADER_TEX, 0);
@@ -1537,13 +1586,13 @@ void CHyprOpenGLImpl::renderTextureInternal(SP<CTexture> tex, const CBox& box, c
 
         if (!damageClip.empty()) {
             damageClip.forEachRect([this](const auto& RECT) {
-                scissor(&RECT);
+                scissor(&RECT, m_renderData.transformDamage);
                 glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             });
         }
     } else {
         data.damage->forEachRect([this](const auto& RECT) {
-            scissor(&RECT);
+            scissor(&RECT, m_renderData.transformDamage);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         });
     }
@@ -1579,8 +1628,8 @@ void CHyprOpenGLImpl::renderTexturePrimitive(SP<CTexture> tex, const CBox& box) 
         tex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         tex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     } else {
-        tex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        tex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        tex->setTexParameter(GL_TEXTURE_MAG_FILTER, tex->magFilter);
+        tex->setTexParameter(GL_TEXTURE_MIN_FILTER, tex->minFilter);
     }
 
     auto shader = useShader(m_shaders->frag[SH_FRAG_PASSTHRURGBA]);
@@ -1589,7 +1638,7 @@ void CHyprOpenGLImpl::renderTexturePrimitive(SP<CTexture> tex, const CBox& box) 
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
 
     m_renderData.damage.forEachRect([this](const auto& RECT) {
-        scissor(&RECT);
+        scissor(&RECT, m_renderData.transformDamage);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     });
 
@@ -1630,7 +1679,7 @@ void CHyprOpenGLImpl::renderTextureMatte(SP<CTexture> tex, const CBox& box, CFra
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
 
     m_renderData.damage.forEachRect([this](const auto& RECT) {
-        scissor(&RECT);
+        scissor(&RECT, m_renderData.transformDamage);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     });
 
@@ -2224,7 +2273,7 @@ void CHyprOpenGLImpl::renderBorder(const CBox& box, const CGradientValueData& gr
 
     if (!borderRegion.empty()) {
         borderRegion.forEachRect([this](const auto& RECT) {
-            scissor(&RECT);
+            scissor(&RECT, m_renderData.transformDamage);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         });
     }
@@ -2313,7 +2362,7 @@ void CHyprOpenGLImpl::renderBorder(const CBox& box, const CGradientValueData& gr
 
     if (!borderRegion.empty()) {
         borderRegion.forEachRect([this](const auto& RECT) {
-            scissor(&RECT);
+            scissor(&RECT, m_renderData.transformDamage);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         });
     }
@@ -2376,13 +2425,13 @@ void CHyprOpenGLImpl::renderRoundedShadow(const CBox& box, int round, float roun
 
         if (!damageClip.empty()) {
             damageClip.forEachRect([this](const auto& RECT) {
-                scissor(&RECT);
+                scissor(&RECT, m_renderData.transformDamage);
                 glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             });
         }
     } else {
         m_renderData.damage.forEachRect([this](const auto& RECT) {
-            scissor(&RECT);
+            scissor(&RECT, m_renderData.transformDamage);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         });
     }
@@ -3012,22 +3061,83 @@ void CHyprOpenGLImpl::setCapStatus(int cap, bool status) {
     }
 }
 
-uint32_t CHyprOpenGLImpl::getPreferredReadFormat(PHLMONITOR pMonitor) {
+DRMFormat CHyprOpenGLImpl::getPreferredReadFormat(PHLMONITOR pMonitor) {
     static const auto PFORCE8BIT = CConfigValue<Hyprlang::INT>("misc:screencopy_force_8b");
 
-    if (!*PFORCE8BIT)
-        return pMonitor->m_output->state->state().drmFormat;
+    auto              monFmt = pMonitor->m_output->state->state().drmFormat;
 
-    auto fmt = pMonitor->m_output->state->state().drmFormat;
+    if (*PFORCE8BIT)
+        if (monFmt == DRM_FORMAT_BGRA1010102 || monFmt == DRM_FORMAT_ARGB2101010 || monFmt == DRM_FORMAT_XRGB2101010 || monFmt == DRM_FORMAT_BGRX1010102 ||
+            monFmt == DRM_FORMAT_XBGR2101010)
+            monFmt = DRM_FORMAT_XRGB8888;
 
-    if (fmt == DRM_FORMAT_BGRA1010102 || fmt == DRM_FORMAT_ARGB2101010 || fmt == DRM_FORMAT_XRGB2101010 || fmt == DRM_FORMAT_BGRX1010102 || fmt == DRM_FORMAT_XBGR2101010)
-        return DRM_FORMAT_XRGB8888;
+    return monFmt;
+}
 
-    return fmt;
+std::vector<uint64_t> CHyprOpenGLImpl::getDRMFormatModifiers(DRMFormat drmFormat) {
+    SDRMFormat format;
+
+    for (const auto& fmt : m_drmFormats) {
+        if (fmt.drmFormat == drmFormat) {
+            format = fmt;
+            break;
+        }
+    }
+
+    return format.modifiers;
 }
 
 bool CHyprOpenGLImpl::explicitSyncSupported() {
     return m_exts.EGL_ANDROID_native_fence_sync_ext;
+}
+
+WP<CShader> CHyprOpenGLImpl::getSurfaceShader(uint8_t features) {
+    if (!m_shaders->fragVariants.contains(features)) {
+
+        auto shader                    = makeShared<CShader>();
+        auto includes                  = m_includes;
+        includes["get_rgb_pixel.glsl"] = includes[features & SH_FEAT_RGBA ? "get_rgba_pixel.glsl" : "get_rgbx_pixel.glsl"];
+        if (!(features & SH_FEAT_DISCARD)) {
+            includes["discard.glsl"]    = "";
+            includes["do_discard.glsl"] = "";
+        }
+        if (!(features & SH_FEAT_TINT)) {
+            includes["tint.glsl"]    = "";
+            includes["do_tint.glsl"] = "";
+        }
+        if (!(features & SH_FEAT_ROUNDING)) {
+            includes["rounding.glsl"]    = "";
+            includes["do_rounding.glsl"] = "";
+        }
+        if (!(features & SH_FEAT_CM)) {
+            includes["surface_CM.glsl"] = "";
+            includes["CM.glsl"]         = "";
+            includes["do_CM.glsl"]      = "";
+        }
+        if (!(features & SH_FEAT_TONEMAP)) {
+            includes["tonemap.glsl"]    = "";
+            includes["do_tonemap.glsl"] = "";
+        }
+        if (!(features & SH_FEAT_SDR_MOD)) {
+            includes["sdr_mod.glsl"]    = "";
+            includes["do_sdr_mod.glsl"] = "";
+        }
+        if (!(features & SH_FEAT_TONEMAP || features & SH_FEAT_SDR_MOD))
+            includes["primaries_xyz.glsl"] = includes["primaries_xyz_const.glsl"];
+
+        Log::logger->log(Log::INFO, "getSurfaceShader: compiling feature set {}", features);
+        const auto fragSrc = processShader("surface.frag", includes, MAX_INCLUDE_DEPTH);
+        if (shader->createProgram(m_shaders->TEXVERTSRC, fragSrc, true, true)) {
+            m_shaders->fragVariants[features] = shader;
+            return shader;
+        } else {
+            Log::logger->log(Log::ERR, "getSurfaceShader failed for {}. Falling back to old branching", features);
+            m_shaders->fragVariants[features] = nullptr;
+        }
+    }
+
+    ASSERT(m_shaders->fragVariants[features]);
+    return m_shaders->fragVariants[features];
 }
 
 std::vector<SDRMFormat> CHyprOpenGLImpl::getDRMFormats() {

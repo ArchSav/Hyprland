@@ -11,12 +11,13 @@
 #include "eventLoop/EventLoopManager.hpp"
 #include "../render/pass/TexPassElement.hpp"
 #include "../managers/input/InputManager.hpp"
-#include "../managers/HookSystemManager.hpp"
 #include "../render/Renderer.hpp"
 #include "../render/OpenGL.hpp"
 #include "../desktop/state/FocusState.hpp"
 #include "SeatManager.hpp"
 #include "../helpers/time/Time.hpp"
+#include "../helpers/Drm.hpp"
+#include "../event/EventBus.hpp"
 #include <cstring>
 #include <gbm.h>
 #include <cairo/cairo.h>
@@ -25,21 +26,19 @@
 using namespace Hyprutils::Utils;
 
 CPointerManager::CPointerManager() {
-    m_hooks.monitorAdded = g_pHookSystem->hookDynamic("monitorAdded", [this](void* self, SCallbackInfo& info, std::any data) {
-        auto PMONITOR = std::any_cast<PHLMONITOR>(data);
-
+    m_hooks.monitorAdded = Event::bus()->m_events.monitor.added.listen([this](PHLMONITOR monitor) {
         onMonitorLayoutChange();
 
-        PMONITOR->m_events.modeChanged.listenStatic([this] { g_pEventLoopManager->doLater([this]() { onMonitorLayoutChange(); }); });
-        PMONITOR->m_events.disconnect.listenStatic([this] { g_pEventLoopManager->doLater([this]() { onMonitorLayoutChange(); }); });
-        PMONITOR->m_events.destroy.listenStatic([this] {
+        monitor->m_events.modeChanged.listenStatic([this] { g_pEventLoopManager->doLater([this]() { onMonitorLayoutChange(); }); });
+        monitor->m_events.disconnect.listenStatic([this] { g_pEventLoopManager->doLater([this]() { onMonitorLayoutChange(); }); });
+        monitor->m_events.destroy.listenStatic([this] {
             if (g_pCompositor && !g_pCompositor->m_isShuttingDown)
                 std::erase_if(m_monitorStates, [](const auto& other) { return other->monitor.expired(); });
         });
     });
 
-    m_hooks.monitorPreRender = g_pHookSystem->hookDynamic("preMonitorCommit", [this](void* self, SCallbackInfo& info, std::any data) {
-        auto state = stateFor(std::any_cast<PHLMONITOR>(data));
+    m_hooks.monitorPreRender = Event::bus()->m_events.monitor.preCommit.listen([this](PHLMONITOR monitor) {
+        auto state = stateFor(monitor);
         if (!state)
             return;
 
@@ -72,8 +71,10 @@ void CPointerManager::lockSoftwareForMonitor(PHLMONITOR mon) {
 void CPointerManager::unlockSoftwareForMonitor(PHLMONITOR mon) {
     auto const state = stateFor(mon);
     state->softwareLocks--;
-    if (state->softwareLocks < 0)
+    if (state->softwareLocks < 0) {
         state->softwareLocks = 0;
+        Log::logger->log(Log::WARN, "Unlocking SW for monitor while it's not locked");
+    }
 
     if (state->softwareLocks == 0)
         updateCursorBackend();
@@ -81,11 +82,20 @@ void CPointerManager::unlockSoftwareForMonitor(PHLMONITOR mon) {
 
 bool CPointerManager::softwareLockedFor(PHLMONITOR mon) {
     auto const state = stateFor(mon);
-    return state->softwareLocks > 0 || state->hardwareFailed;
+    return state->softwareLocks > 0 || (state->hardwareFailed && hasCursor() && g_pHyprRenderer->shouldRenderCursor());
+}
+
+bool CPointerManager::hasVisibleHWCursor(PHLMONITOR pMonitor) {
+    auto const state = stateFor(pMonitor);
+    return state->softwareLocks == 0 && !state->hardwareFailed && hasCursor() && g_pHyprRenderer->shouldRenderCursor();
 }
 
 Vector2D CPointerManager::position() {
     return m_pointerPos;
+}
+
+Vector2D CPointerManager::hotspot() {
+    return m_currentCursorImage.hotspot;
 }
 
 bool CPointerManager::hasCursor() {
@@ -107,6 +117,7 @@ void CPointerManager::setCursorBuffer(SP<Aquamarine::IBuffer> buf, const Vector2
             m_currentCursorImage.scale   = scale;
             updateCursorBackend();
             damageIfSoftware();
+            m_events.cursorChanged.emit();
         }
 
         return;
@@ -124,6 +135,7 @@ void CPointerManager::setCursorBuffer(SP<Aquamarine::IBuffer> buf, const Vector2
 
     updateCursorBackend();
     damageIfSoftware();
+    m_events.cursorChanged.emit();
 }
 
 void CPointerManager::setCursorSurface(SP<Desktop::View::CWLSurface> surf, const Vector2D& hotspot) {
@@ -135,6 +147,7 @@ void CPointerManager::setCursorSurface(SP<Desktop::View::CWLSurface> surf, const
             m_currentCursorImage.scale   = surf && surf->resource() ? surf->resource()->m_current.scale : 1.F;
             updateCursorBackend();
             damageIfSoftware();
+            m_events.cursorChanged.emit();
         }
 
         return;
@@ -156,6 +169,7 @@ void CPointerManager::setCursorSurface(SP<Desktop::View::CWLSurface> surf, const
             recheckEnteredOutputs();
             updateCursorBackend();
             damageIfSoftware();
+            m_events.cursorChanged.emit();
         });
 
         if (surf->resource()->m_current.texture) {
@@ -169,6 +183,7 @@ void CPointerManager::setCursorSurface(SP<Desktop::View::CWLSurface> surf, const
     recheckEnteredOutputs();
     updateCursorBackend();
     damageIfSoftware();
+    m_events.cursorChanged.emit();
 }
 
 void CPointerManager::recheckEnteredOutputs() {
@@ -253,6 +268,8 @@ void CPointerManager::resetCursorImage(bool apply) {
             ms->cursorFrontBuffer = nullptr;
         }
     }
+
+    m_events.cursorChanged.emit();
 }
 
 void CPointerManager::updateCursorBackend() {
@@ -433,7 +450,7 @@ SP<Aquamarine::IBuffer> CPointerManager::renderHWCursorBuffer(SP<CPointerManager
         options.length   = 2;
         options.scanout  = true;
         options.cursor   = true;
-        options.multigpu = state->monitor->m_output->getBackend()->preferredAllocator()->drmFD() != g_pCompositor->m_drm.fd;
+        options.multigpu = !DRM::sameGpu(state->monitor->m_output->getBackend()->preferredAllocator()->drmFD(), g_pCompositor->m_drm.fd);
         // We do not set the format (unless shm). If it's unset (DRM_FORMAT_INVALID) then the swapchain will pick for us,
         // but if it's set, we don't wanna change it.
         if (shouldUseCpuBuffer)
@@ -737,17 +754,26 @@ Vector2D CPointerManager::closestValid(const Vector2D& pos) {
 }
 
 void CPointerManager::damageIfSoftware() {
+    if (g_pCompositor->m_unsafeState)
+        return;
+
     auto b = getCursorBoxGlobal().expand(4);
 
     for (auto const& mw : m_monitorStates) {
-        if (mw->monitor.expired() || !mw->monitor->m_output)
+        auto monitor = mw->monitor.lock();
+        if (!monitor || !monitor->m_output || monitor->isMirror())
             continue;
 
-        if ((mw->softwareLocks > 0 || mw->hardwareFailed || g_pConfigManager->shouldUseSoftwareCursors(mw->monitor.lock())) &&
-            b.overlaps({mw->monitor->m_position, mw->monitor->m_size})) {
-            g_pHyprRenderer->damageBox(b, mw->monitor->shouldSkipScheduleFrameOnMouseEvent());
-            break;
-        }
+        auto usesSoftwareCursor = (mw->softwareLocks > 0 || mw->hardwareFailed || g_pConfigManager->shouldUseSoftwareCursors(monitor));
+        if (!usesSoftwareCursor)
+            continue;
+
+        auto shouldAddDamage = !monitor->shouldSkipScheduleFrameOnMouseEvent() && b.overlaps({monitor->m_position, monitor->m_size});
+        if (!shouldAddDamage)
+            continue;
+
+        CBox damageBox = b.copy().translate(-monitor->m_position).scale(monitor->m_scale).round();
+        monitor->addDamage(damageBox);
     }
 }
 
@@ -871,6 +897,10 @@ void CPointerManager::onMonitorLayoutChange() {
     damageIfSoftware();
 }
 
+const CPointerManager::SCursorImage& CPointerManager::currentCursorImage() {
+    return m_currentCursorImage;
+}
+
 SP<CTexture> CPointerManager::getCurrentCursorTexture() {
     if (!m_currentCursorImage.pBuffer && (!m_currentCursorImage.surface || !m_currentCursorImage.surface->resource()->m_current.texture))
         return nullptr;
@@ -919,24 +949,11 @@ void CPointerManager::attachPointer(SP<IPointer> pointer) {
         PROTO::idle->onActivity();
     });
 
-    listener->axis = pointer->m_pointerEvents.axis.listen([weak = WP<IPointer>(pointer)](const IPointer::SAxisEvent& event) {
+    listener->axis  = pointer->m_pointerEvents.axis.listen([weak = WP<IPointer>(pointer)](const IPointer::SAxisEvent& event) {
         g_pInputManager->onMouseWheel(event, weak.lock());
         PROTO::idle->onActivity();
     });
-
-    listener->frame = pointer->m_pointerEvents.frame.listen([] {
-        bool shouldSkip = false;
-        if (!g_pSeatManager->m_mouse.expired() && g_pInputManager->isLocked()) {
-            auto PMONITOR = Desktop::focusState()->monitor().get();
-            if (PMONITOR && PMONITOR->shouldSkipScheduleFrameOnMouseEvent()) {
-                auto fsWindow = PMONITOR->m_activeWorkspace->getFullscreenWindow();
-                shouldSkip    = fsWindow && fsWindow->m_isX11;
-            }
-        }
-        g_pSeatManager->m_isPointerFrameSkipped = shouldSkip;
-        if (!g_pSeatManager->m_isPointerFrameSkipped)
-            g_pSeatManager->sendPointerFrame();
-    });
+    listener->frame = pointer->m_pointerEvents.frame.listen([] { g_pInputManager->onPointerFrame(); });
 
     listener->swipeBegin = pointer->m_pointerEvents.swipeBegin.listen([](const IPointer::SSwipeBeginEvent& event) {
         g_pInputManager->onSwipeBegin(event);
@@ -1089,7 +1106,7 @@ void CPointerManager::detachTablet(SP<CTablet> tablet) {
     std::erase_if(m_tabletListeners, [tablet](const auto& e) { return e->tablet.expired() || e->tablet == tablet; });
 }
 
-void CPointerManager::damageCursor(PHLMONITOR pMonitor) {
+void CPointerManager::damageCursor(PHLMONITOR pMonitor, bool skipFrameSchedule) {
     for (auto const& mw : m_monitorStates) {
         if (mw->monitor != pMonitor)
             continue;
@@ -1099,7 +1116,7 @@ void CPointerManager::damageCursor(PHLMONITOR pMonitor) {
         if (b.empty())
             return;
 
-        g_pHyprRenderer->damageBox(b);
+        g_pHyprRenderer->damageBox(b, skipFrameSchedule);
 
         return;
     }
@@ -1107,23 +1124,4 @@ void CPointerManager::damageCursor(PHLMONITOR pMonitor) {
 
 Vector2D CPointerManager::cursorSizeLogical() {
     return m_currentCursorImage.size / m_currentCursorImage.scale;
-}
-
-void CPointerManager::storeMovement(uint64_t time, const Vector2D& delta, const Vector2D& deltaUnaccel) {
-    m_storedTime = time;
-    m_storedDelta += delta;
-    m_storedUnaccel += deltaUnaccel;
-}
-
-void CPointerManager::setStoredMovement(uint64_t time, const Vector2D& delta, const Vector2D& deltaUnaccel) {
-    m_storedTime    = time;
-    m_storedDelta   = delta;
-    m_storedUnaccel = deltaUnaccel;
-}
-
-void CPointerManager::sendStoredMovement() {
-    PROTO::relativePointer->sendRelativeMotion(m_storedTime * 1000, m_storedDelta, m_storedUnaccel);
-    m_storedTime    = 0;
-    m_storedDelta   = Vector2D{};
-    m_storedUnaccel = Vector2D{};
 }

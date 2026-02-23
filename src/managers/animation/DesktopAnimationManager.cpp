@@ -4,10 +4,12 @@
 
 #include "../../desktop/view/LayerSurface.hpp"
 #include "../../desktop/view/Window.hpp"
+#include "../../desktop/view/Group.hpp"
 #include "../../desktop/Workspace.hpp"
 
 #include "../../config/ConfigManager.hpp"
 #include "../../Compositor.hpp"
+#include "desktop/DesktopTypes.hpp"
 #include "wlr-layer-shell-unstable-v1.hpp"
 
 void CDesktopAnimationManager::startAnimation(PHLWINDOW pWindow, eAnimationType type, bool force) {
@@ -468,7 +470,7 @@ void CDesktopAnimationManager::setFullscreenFadeAnimation(PHLWORKSPACE ws, eAnim
                 *w->m_alpha = 1.F;
             else if (!w->isFullscreen()) {
                 const bool CREATED_OVER_FS   = w->m_createdOverFullscreen;
-                const bool IS_IN_GROUP_OF_FS = FSWINDOW && FSWINDOW->hasInGroup(w);
+                const bool IS_IN_GROUP_OF_FS = FSWINDOW && FSWINDOW->m_group && FSWINDOW->m_group->has(w);
                 *w->m_alpha                  = !CREATED_OVER_FS && !IS_IN_GROUP_OF_FS ? 0.f : 1.f;
             }
         }
@@ -482,6 +484,13 @@ void CDesktopAnimationManager::setFullscreenFadeAnimation(PHLWORKSPACE ws, eAnim
                 *ls->m_alpha = FULLSCREEN && ws->m_fullscreenMode == FSMODE_FULLSCREEN ? 0.f : 1.f;
         }
     }
+}
+
+void CDesktopAnimationManager::setFullscreenFloatingFade(PHLWINDOW pWindow, float fade) {
+    if (pWindow->m_fadingOut || !pWindow->m_isFloating)
+        return;
+
+    *pWindow->m_alpha = fade;
 }
 
 void CDesktopAnimationManager::overrideFullscreenFadeAmount(PHLWORKSPACE ws, float fade, PHLWINDOW exclude) {

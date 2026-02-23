@@ -177,6 +177,7 @@ class CMonitor {
 
     // for direct scanout
     PHLWINDOWREF m_lastScanout;
+    bool         m_directScanoutIsActive    = false; // for cleanup logic. m_lastScanout.expired() can become true before the DS cleanup if client crashes/exits while DS is active.
     bool         m_scanoutNeedsCursorUpdate = false;
 
     // for special fade/blur
@@ -207,6 +208,7 @@ class CMonitor {
     } m_tearingState;
 
     struct {
+        CSignalT<> commit;
         CSignalT<> destroy;
         CSignalT<> connect;
         CSignalT<> disconnect;
@@ -232,9 +234,8 @@ class CMonitor {
         DS_BLOCK_SURFACE   = (1 << 8),
         DS_BLOCK_TRANSFORM = (1 << 9),
         DS_BLOCK_DMA       = (1 << 10),
-        DS_BLOCK_TEARING   = (1 << 11),
-        DS_BLOCK_FAILED    = (1 << 12),
-        DS_BLOCK_CM        = (1 << 13),
+        DS_BLOCK_FAILED    = (1 << 11),
+        DS_BLOCK_CM        = (1 << 12),
 
         DS_CHECKS_COUNT = 14,
     };
@@ -275,8 +276,9 @@ class CMonitor {
         TC_SUPPORT   = (1 << 4),
         TC_CANDIDATE = (1 << 5),
         TC_WINDOW    = (1 << 6),
+        TC_HW_CURSOR = (1 << 7),
 
-        TC_CHECKS_COUNT = 7,
+        TC_CHECKS_COUNT = 8,
     };
 
     // methods

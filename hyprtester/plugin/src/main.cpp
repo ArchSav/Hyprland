@@ -6,8 +6,6 @@
 #define private public
 #include <src/config/ConfigManager.hpp>
 #include <src/config/ConfigDescriptions.hpp>
-#include <src/layout/IHyprLayout.hpp>
-#include <src/managers/LayoutManager.hpp>
 #include <src/managers/input/InputManager.hpp>
 #include <src/managers/PointerManager.hpp>
 #include <src/managers/input/trackpad/TrackpadGestures.hpp>
@@ -15,6 +13,7 @@
 #include <src/desktop/rule/windowRule/WindowRuleApplicator.hpp>
 #include <src/Compositor.hpp>
 #include <src/desktop/state/FocusState.hpp>
+#include <src/layout/LayoutManager.hpp>
 #undef private
 
 #include <hyprutils/utils/ScopeGuard.hpp>
@@ -53,8 +52,9 @@ static SDispatchResult snapMove(std::string in) {
     Vector2D pos  = PLASTWINDOW->m_realPosition->goal();
     Vector2D size = PLASTWINDOW->m_realSize->goal();
 
-    g_pLayoutManager->getCurrentLayout()->performSnap(pos, size, PLASTWINDOW, MBIND_MOVE, -1, size);
-    *PLASTWINDOW->m_realPosition = pos.round();
+    g_layoutManager->performSnap(pos, size, PLASTWINDOW->layoutTarget(), MBIND_MOVE, -1, size);
+
+    PLASTWINDOW->layoutTarget()->setPositionGlobal(CBox{pos, size});
 
     return {};
 }
@@ -298,6 +298,24 @@ static SDispatchResult checkRule(std::string in) {
     return {};
 }
 
+static SDispatchResult floatingFocusOnFullscreen(std::string in) {
+    const auto PLASTWINDOW = Desktop::focusState()->window();
+
+    if (!PLASTWINDOW)
+        return {.success = false, .error = "No window"};
+
+    if (!PLASTWINDOW->m_isFloating)
+        return {.success = false, .error = "Window must be floating"};
+
+    if (PLASTWINDOW->m_alpha != 1.f)
+        return {.success = false, .error = "floating window doesnt restore it opacity when focused on fullscreen workspace"};
+
+    if (!PLASTWINDOW->m_createdOverFullscreen)
+        return {.success = false, .error = "floating window doesnt get flagged as createdOverFullscreen"};
+
+    return {};
+}
+
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     PHANDLE = handle;
 
@@ -311,6 +329,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(PHANDLE, "plugin:test:keybind", ::keybind);
     HyprlandAPI::addDispatcherV2(PHANDLE, "plugin:test:add_rule", ::addRule);
     HyprlandAPI::addDispatcherV2(PHANDLE, "plugin:test:check_rule", ::checkRule);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "plugin:test:floating_focus_on_fullscreen", ::floatingFocusOnFullscreen);
 
     // init mouse
     g_mouse = CTestMouse::create(false);

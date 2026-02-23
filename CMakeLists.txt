@@ -110,6 +110,7 @@ add_compile_options(
   -Wno-narrowing
   -Wno-pointer-arith
   -Wno-clobbered
+  -frtti
   -fmacro-prefix-map=${CMAKE_SOURCE_DIR}/=)
 
 # disable lto as it may break plugins
@@ -243,7 +244,7 @@ configure_file(
 set_source_files_properties(${CMAKE_SOURCE_DIR}/src/version.h PROPERTIES GENERATED TRUE)
 
 set(XKBCOMMON_MINIMUM_VERSION 1.11.0)
-set(WAYLAND_SERVER_MINIMUM_VERSION 1.22.90)
+set(WAYLAND_SERVER_MINIMUM_VERSION 1.22.91)
 set(WAYLAND_SERVER_PROTOCOLS_MINIMUM_VERSION 1.45)
 set(LIBINPUT_MINIMUM_VERSION 1.28)
 
@@ -476,7 +477,11 @@ function(protocolWayland)
   set(PROTOCOL_SOURCES "${PROTOCOL_SOURCES}" PARENT_SCOPE)
 endfunction()
 
-target_link_libraries(hyprland_lib PUBLIC OpenGL::EGL OpenGL::GL Threads::Threads)
+if(TARGET OpenGL::GL)
+  target_link_libraries(hyprland_lib PUBLIC OpenGL::EGL OpenGL::GL Threads::Threads)
+else()
+  target_link_libraries(hyprland_lib PUBLIC OpenGL::EGL OpenGL::GLES3 Threads::Threads)
+endif()
 
 pkg_check_modules(hyprland_protocols_dep hyprland-protocols>=0.6.4)
 if(hyprland_protocols_dep_FOUND)
@@ -551,6 +556,8 @@ protocolnew("staging/ext-data-control" "ext-data-control-v1" false)
 protocolnew("staging/pointer-warp" "pointer-warp-v1" false)
 protocolnew("staging/fifo" "fifo-v1" false)
 protocolnew("staging/commit-timing" "commit-timing-v1" false)
+protocolnew("staging/ext-image-capture-source" "ext-image-capture-source-v1" false)
+protocolnew("staging/ext-image-copy-capture" "ext-image-copy-capture-v1" false)
 
 protocolwayland()
 

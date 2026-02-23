@@ -35,13 +35,15 @@
 #include "../../managers/SeatManager.hpp"
 #include "../../managers/KeybindManager.hpp"
 #include "../../render/Renderer.hpp"
-#include "../../managers/HookSystemManager.hpp"
 #include "../../managers/EventManager.hpp"
-#include "../../managers/LayoutManager.hpp"
 #include "../../managers/permissions/DynamicPermissionManager.hpp"
 
 #include "../../helpers/time/Time.hpp"
 #include "../../helpers/MiscFunctions.hpp"
+
+#include "../../layout/LayoutManager.hpp"
+
+#include "../../event/EventBus.hpp"
 
 #include "trackpad/TrackpadGestures.hpp"
 #include "../cursor/CursorShapeOverrideController.hpp"
@@ -130,16 +132,10 @@ void CInputManager::onMouseMoved(IPointer::SMotionEvent e) {
 
     const auto DELTA = *PNOACCEL == 1 ? unaccel : delta;
 
-    if (g_pSeatManager->m_isPointerFrameSkipped)
-        g_pPointerManager->storeMovement(e.timeMs, DELTA, unaccel);
-    else
-        g_pPointerManager->setStoredMovement(e.timeMs, DELTA, unaccel);
-
-    PROTO::relativePointer->sendRelativeMotion(sc<uint64_t>(e.timeMs) * 1000, DELTA, unaccel);
-
     if (e.mouse)
         recheckMouseWarpOnMouseInput();
 
+    PROTO::relativePointer->sendRelativeMotion(sc<uint64_t>(e.timeMs) * 1000, delta, unaccel);
     g_pPointerManager->move(DELTA);
 
     mouseMoveUnified(e.timeMs, false, e.mouse);
@@ -151,6 +147,8 @@ void CInputManager::onMouseMoved(IPointer::SMotionEvent e) {
 
     if (e.mouse)
         m_lastMousePos = getMouseCoordsInternal();
+
+    g_pSeatManager->sendPointerFrame();
 }
 
 void CInputManager::onMouseWarp(IPointer::SMotionAbsoluteEvent e) {
@@ -234,8 +232,12 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
     Vector2D               surfacePos = Vector2D(-1337, -1337);
     PHLWINDOW              pFoundWindow;
     PHLLS                  pFoundLayerSurface;
+    const auto             FOCUS_REASON = refocus ? Desktop::FOCUS_REASON_CLICK : Desktop::FOCUS_REASON_FFM;
 
-    EMIT_HOOK_EVENT_CANCELLABLE("mouseMove", MOUSECOORDSFLOORED);
+    Event::SCallbackInfo   info;
+    Event::bus()->m_events.input.mouse.move.emit(MOUSECOORDSFLOORED, info);
+    if (info.cancelled)
+        return;
 
     m_lastCursorPosFloored = MOUSECOORDSFLOORED;
 
@@ -369,7 +371,7 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
         }
     }
 
-    g_pLayoutManager->getCurrentLayout()->onMouseMove(getMouseCoordsInternal());
+    g_layoutManager->moveMouse(getMouseCoordsInternal());
 
     // forced above all
     if (!g_pInputManager->m_exclusiveLSes.empty()) {
@@ -526,7 +528,7 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
         g_pSeatManager->setPointerFocus(nullptr, {});
 
         if (refocus || !Desktop::focusState()->window()) // if we are forcing a refocus, and we don't find a surface, clear the kb focus too!
-            Desktop::focusState()->rawWindowFocus(nullptr);
+            Desktop::focusState()->rawWindowFocus(nullptr, FOCUS_REASON);
 
         return;
     }
@@ -554,7 +556,7 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
         m_foundSurfaceToFocus = foundSurface;
     }
 
-    if (m_currentlyDraggedWindow.lock() && pFoundWindow != m_currentlyDraggedWindow) {
+    if (g_layoutManager->dragController()->target() && pFoundWindow != g_layoutManager->dragController()->target()) {
         g_pSeatManager->setPointerFocus(foundSurface, surfaceLocal);
         return;
     }
@@ -586,7 +588,7 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
                 ((pFoundWindow->m_isFloating && *PFLOATBEHAVIOR == 2) || (Desktop::focusState()->window()->m_isFloating != pFoundWindow->m_isFloating && *PFLOATBEHAVIOR != 0))) {
                 // enter if change floating style
                 if (FOLLOWMOUSE != 3 && allowKeyboardRefocus)
-                    Desktop::focusState()->rawWindowFocus(pFoundWindow, foundSurface);
+                    Desktop::focusState()->rawWindowFocus(pFoundWindow, FOCUS_REASON, foundSurface);
                 g_pSeatManager->setPointerFocus(foundSurface, surfaceLocal);
             } else if (FOLLOWMOUSE == 2 || FOLLOWMOUSE == 3)
                 g_pSeatManager->setPointerFocus(foundSurface, surfaceLocal);
@@ -614,7 +616,7 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
                             const bool hasNoFollowMouse = pFoundWindow && pFoundWindow->m_ruleApplicator->noFollowMouse().valueOrDefault();
 
                             if (refocus || !hasNoFollowMouse)
-                                Desktop::focusState()->rawWindowFocus(pFoundWindow, foundSurface);
+                                Desktop::focusState()->rawWindowFocus(pFoundWindow, FOCUS_REASON, foundSurface);
                         }
                     } else
                         Desktop::focusState()->rawSurfaceFocus(foundSurface, pFoundWindow);
@@ -623,7 +625,7 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
         }
 
         if (g_pSeatManager->m_state.keyboardFocus == nullptr)
-            Desktop::focusState()->rawWindowFocus(pFoundWindow, foundSurface);
+            Desktop::focusState()->rawWindowFocus(pFoundWindow, FOCUS_REASON, foundSurface);
 
         m_lastFocusOnLS = false;
     } else {
@@ -646,7 +648,10 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
 }
 
 void CInputManager::onMouseButton(IPointer::SButtonEvent e, SP<IPointer> mouse) {
-    EMIT_HOOK_EVENT_CANCELLABLE("mouseButton", e);
+    Event::SCallbackInfo info;
+    Event::bus()->m_events.input.mouse.button.emit(e, info);
+    if (info.cancelled)
+        return;
 
     if (e.mouse)
         recheckMouseWarpOnMouseInput();
@@ -676,6 +681,8 @@ void CInputManager::onMouseButton(IPointer::SButtonEvent e, SP<IPointer> mouse) 
         m_focusHeldByButtons   = false;
         m_refocusHeldByButtons = false;
     }
+
+    g_pSeatManager->sendPointerFrame();
 }
 
 void CInputManager::processMouseRequest(const CSeatManager::SSetCursorEvent& event) {
@@ -866,8 +873,10 @@ void CInputManager::onMouseWheel(IPointer::SAxisEvent e, SP<IPointer> pointer) {
     if (pointer && pointer->m_scrollFactor.has_value())
         factor = *pointer->m_scrollFactor;
 
-    const auto EMAP = std::unordered_map<std::string, std::any>{{"event", e}};
-    EMIT_HOOK_EVENT_CANCELLABLE("mouseAxis", EMAP);
+    Event::SCallbackInfo info;
+    Event::bus()->m_events.input.mouse.axis.emit(e, info);
+    if (info.cancelled)
+        return;
 
     if (e.mouse)
         recheckMouseWarpOnMouseInput();
@@ -954,6 +963,23 @@ void CInputManager::onMouseWheel(IPointer::SAxisEvent e, SP<IPointer> pointer) {
     int32_t deltaDiscrete = std::abs(discrete) != 0 && std::abs(discrete) < 1 ? std::copysign(1, discrete) : std::round(discrete);
 
     g_pSeatManager->sendPointerAxis(e.timeMs, e.axis, delta, deltaDiscrete, value120, e.source, WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+
+    const bool deferPointerFrame = e.source == WL_POINTER_AXIS_SOURCE_FINGER || e.source == WL_POINTER_AXIS_SOURCE_CONTINUOUS;
+    if (deferPointerFrame) {
+        m_pointerAxisFramePending = true;
+        return;
+    }
+
+    m_pointerAxisFramePending = false;
+    g_pSeatManager->sendPointerFrame();
+}
+
+void CInputManager::onPointerFrame() {
+    if (!m_pointerAxisFramePending)
+        return;
+
+    m_pointerAxisFramePending = false;
+    g_pSeatManager->sendPointerFrame();
 }
 
 Vector2D CInputManager::getMouseCoordsInternal() {
@@ -1039,7 +1065,7 @@ void CInputManager::setupKeyboard(SP<IKeyboard> keeb) {
         }
 
         g_pEventManager->postEvent(SHyprIPCEvent{"activelayout", PKEEB->m_hlName + "," + LAYOUT});
-        EMIT_HOOK_EVENT("activeLayout", (std::vector<std::any>{PKEEB, LAYOUT}));
+        Event::bus()->m_events.input.keyboard.layout.emit(PKEEB, LAYOUT);
     });
 
     disableAllKeyboards(false);
@@ -1141,7 +1167,7 @@ void CInputManager::applyConfigToKeyboard(SP<IKeyboard> pKeyboard) {
     const auto LAYOUTSTR = pKeyboard->getActiveLayout();
 
     g_pEventManager->postEvent(SHyprIPCEvent{"activelayout", pKeyboard->m_hlName + "," + LAYOUTSTR});
-    EMIT_HOOK_EVENT("activeLayout", (std::vector<std::any>{pKeyboard, LAYOUTSTR}));
+    Event::bus()->m_events.input.keyboard.layout.emit(pKeyboard, LAYOUTSTR);
 
     Log::logger->log(Log::DEBUG, "Set the keyboard layout to {} and variant to {} for keyboard \"{}\"", pKeyboard->m_currentRules.layout, pKeyboard->m_currentRules.variant,
                      pKeyboard->m_hlName);
@@ -1468,14 +1494,16 @@ void CInputManager::onKeyboardKey(const IKeyboard::SKeyEvent& event, SP<IKeyboar
     if (!pKeyboard->m_enabled || !pKeyboard->m_allowed)
         return;
 
-    const bool DISALLOWACTION = pKeyboard->isVirtual() && shouldIgnoreVirtualKeyboard(pKeyboard);
+    const bool           DISALLOWACTION = pKeyboard->isVirtual() && shouldIgnoreVirtualKeyboard(pKeyboard);
 
-    const auto IME    = m_relay.m_inputMethod.lock();
-    const bool HASIME = IME && IME->hasGrab();
-    const bool USEIME = HASIME && !DISALLOWACTION;
+    const auto           IME    = m_relay.m_inputMethod.lock();
+    const bool           HASIME = IME && IME->hasGrab();
+    const bool           USEIME = HASIME && !DISALLOWACTION;
 
-    const auto EMAP = std::unordered_map<std::string, std::any>{{"keyboard", pKeyboard}, {"event", event}};
-    EMIT_HOOK_EVENT_CANCELLABLE("keyPress", EMAP);
+    Event::SCallbackInfo info;
+    Event::bus()->m_events.input.keyboard.key.emit(event, info);
+    if (info.cancelled)
+        return;
 
     bool passEvent = DISALLOWACTION;
 
@@ -1564,7 +1592,7 @@ void CInputManager::onKeyboardMod(SP<IKeyboard> pKeyboard) {
         Log::logger->log(Log::DEBUG, "LAYOUT CHANGED TO {} GROUP {}", LAYOUT, MODS.group);
 
         g_pEventManager->postEvent(SHyprIPCEvent{"activelayout", pKeyboard->m_hlName + "," + LAYOUT});
-        EMIT_HOOK_EVENT("activeLayout", (std::vector<std::any>{pKeyboard, LAYOUT}));
+        Event::bus()->m_events.input.keyboard.layout.emit(pKeyboard, LAYOUT);
     }
 }
 
@@ -1624,13 +1652,13 @@ bool CInputManager::refocusLastWindow(PHLMONITOR pMonitor) {
     if (!foundSurface && Desktop::focusState()->window() && Desktop::focusState()->window()->m_workspace && Desktop::focusState()->window()->m_workspace->isVisibleNotCovered()) {
         // then the last focused window if we're on the same workspace as it
         const auto PLASTWINDOW = Desktop::focusState()->window();
-        Desktop::focusState()->fullWindowFocus(PLASTWINDOW);
+        Desktop::focusState()->fullWindowFocus(PLASTWINDOW, Desktop::FOCUS_REASON_FFM);
     } else {
         // otherwise fall back to a normal refocus.
 
         if (foundSurface && !foundSurface->m_hlSurface->keyboardFocusable()) {
             const auto PLASTWINDOW = Desktop::focusState()->window();
-            Desktop::focusState()->fullWindowFocus(PLASTWINDOW);
+            Desktop::focusState()->fullWindowFocus(PLASTWINDOW, Desktop::FOCUS_REASON_FFM);
         }
 
         refocus();
@@ -1946,7 +1974,7 @@ void CInputManager::setCursorIconOnBorder(PHLWINDOW w) {
 
     if (w->hasPopupAt(mouseCoords))
         direction = BORDERICON_NONE;
-    else if (!boxFullGrabInput.containsPoint(mouseCoords) || (!m_currentlyHeldButtons.empty() && m_currentlyDraggedWindow.expired()))
+    else if (!boxFullGrabInput.containsPoint(mouseCoords) || (!m_currentlyHeldButtons.empty() && !g_layoutManager->dragController()->target()))
         direction = BORDERICON_NONE;
     else {
 
@@ -2032,7 +2060,10 @@ void CInputManager::recheckMouseWarpOnMouseInput() {
 }
 
 void CInputManager::onSwipeBegin(IPointer::SSwipeBeginEvent e) {
-    EMIT_HOOK_EVENT_CANCELLABLE("swipeBegin", e);
+    Event::SCallbackInfo info;
+    Event::bus()->m_events.gesture.swipe.begin.emit(e, info);
+    if (info.cancelled)
+        return;
 
     g_pTrackpadGestures->gestureBegin(e);
 
@@ -2040,7 +2071,10 @@ void CInputManager::onSwipeBegin(IPointer::SSwipeBeginEvent e) {
 }
 
 void CInputManager::onSwipeUpdate(IPointer::SSwipeUpdateEvent e) {
-    EMIT_HOOK_EVENT_CANCELLABLE("swipeUpdate", e);
+    Event::SCallbackInfo info;
+    Event::bus()->m_events.gesture.swipe.update.emit(e, info);
+    if (info.cancelled)
+        return;
 
     g_pTrackpadGestures->gestureUpdate(e);
 
@@ -2048,7 +2082,10 @@ void CInputManager::onSwipeUpdate(IPointer::SSwipeUpdateEvent e) {
 }
 
 void CInputManager::onSwipeEnd(IPointer::SSwipeEndEvent e) {
-    EMIT_HOOK_EVENT_CANCELLABLE("swipeEnd", e);
+    Event::SCallbackInfo info;
+    Event::bus()->m_events.gesture.swipe.end.emit(e, info);
+    if (info.cancelled)
+        return;
 
     g_pTrackpadGestures->gestureEnd(e);
 
@@ -2056,7 +2093,10 @@ void CInputManager::onSwipeEnd(IPointer::SSwipeEndEvent e) {
 }
 
 void CInputManager::onPinchBegin(IPointer::SPinchBeginEvent e) {
-    EMIT_HOOK_EVENT_CANCELLABLE("pinchBegin", e);
+    Event::SCallbackInfo info;
+    Event::bus()->m_events.gesture.pinch.begin.emit(e, info);
+    if (info.cancelled)
+        return;
 
     g_pTrackpadGestures->gestureBegin(e);
 
@@ -2064,7 +2104,10 @@ void CInputManager::onPinchBegin(IPointer::SPinchBeginEvent e) {
 }
 
 void CInputManager::onPinchUpdate(IPointer::SPinchUpdateEvent e) {
-    EMIT_HOOK_EVENT_CANCELLABLE("pinchUpdate", e);
+    Event::SCallbackInfo info;
+    Event::bus()->m_events.gesture.pinch.update.emit(e, info);
+    if (info.cancelled)
+        return;
 
     g_pTrackpadGestures->gestureUpdate(e);
 
@@ -2072,7 +2115,10 @@ void CInputManager::onPinchUpdate(IPointer::SPinchUpdateEvent e) {
 }
 
 void CInputManager::onPinchEnd(IPointer::SPinchEndEvent e) {
-    EMIT_HOOK_EVENT_CANCELLABLE("pinchEnd", e);
+    Event::SCallbackInfo info;
+    Event::bus()->m_events.gesture.pinch.end.emit(e, info);
+    if (info.cancelled)
+        return;
 
     g_pTrackpadGestures->gestureEnd(e);
 

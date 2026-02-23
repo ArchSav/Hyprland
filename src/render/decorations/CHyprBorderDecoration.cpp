@@ -4,7 +4,6 @@
 #include "../../managers/eventLoop/EventLoopManager.hpp"
 #include "../pass/BorderPassElement.hpp"
 #include "../Renderer.hpp"
-#include "../../managers/HookSystemManager.hpp"
 
 CHyprBorderDecoration::CHyprBorderDecoration(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow), m_window(pWindow) {
     ;
@@ -115,7 +114,7 @@ void CHyprBorderDecoration::updateWindow(PHLWINDOW) {
 }
 
 void CHyprBorderDecoration::damageEntire() {
-    if (!validMapped(m_window))
+    if (!validMapped(m_window) || m_window->m_fullscreenState.internal == FSMODE_FULLSCREEN)
         return;
 
     auto       surfaceBox   = m_window->getWindowMainSurfaceBox();

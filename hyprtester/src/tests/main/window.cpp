@@ -378,6 +378,26 @@ static void testMaximizeSize() {
     EXPECT(Tests::windowCount(), 0);
 }
 
+static void testFloatingFocusOnFullscreen() {
+    NLog::log("{}Testing floating focus on fullscreen", Colors::GREEN);
+
+    EXPECT(spawnKitty("kitty_A"), true);
+    OK(getFromSocket("/dispatch togglefloating"));
+
+    EXPECT(spawnKitty("kitty_B"), true);
+    OK(getFromSocket("/dispatch fullscreen 1"));
+
+    OK(getFromSocket("/dispatch cyclenext"));
+
+    OK(getFromSocket("/dispatch plugin:test:floating_focus_on_fullscreen"));
+
+    NLog::log("{}Killing all windows", Colors::YELLOW);
+    Tests::killAllWindows();
+
+    NLog::log("{}Expecting 0 windows", Colors::YELLOW);
+    EXPECT(Tests::windowCount(), 0);
+}
+
 static void testGroupFallbackFocus() {
     NLog::log("{}Testing group fallback focus", Colors::GREEN);
 
@@ -950,7 +970,8 @@ static bool test() {
     Tests::killAllWindows();
 
     // test expression rules
-    OK(getFromSocket("/keyword windowrule match:class expr_kitty, float yes, size monitor_w*0.5 monitor_h*0.5, move 20+(monitor_w*0.1) monitor_h*0.5"));
+    OK(getFromSocket("/keyword windowrule match:class expr_kitty, float yes, size monitor_w*0.5 monitor_h*0.5, min_size monitor_w*0.25 monitor_h*0.25, "
+                     "max_size monitor_w*0.75 monitor_h*0.75, move 20+(monitor_w*0.1) monitor_h*0.5"));
 
     if (!spawnKitty("expr_kitty"))
         return false;
@@ -960,6 +981,14 @@ static bool test() {
         EXPECT_CONTAINS(str, "floating: 1");
         EXPECT_CONTAINS(str, "at: 212,540");
         EXPECT_CONTAINS(str, "size: 960,540");
+
+        auto min = getFromSocket("/getprop active min_size");
+        EXPECT_CONTAINS(min, "480");
+        EXPECT_CONTAINS(min, "270");
+
+        auto max = getFromSocket("/getprop active max_size");
+        EXPECT_CONTAINS(max, "1440");
+        EXPECT_CONTAINS(max, "810");
     }
 
     OK(getFromSocket("/reload"));
@@ -994,6 +1023,7 @@ static bool test() {
 
     testGroupRules();
     testMaximizeSize();
+    testFloatingFocusOnFullscreen();
     testBringActiveToTopMouseMovement();
     testGroupFallbackFocus();
     testInitialFloatSize();

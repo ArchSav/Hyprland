@@ -18,13 +18,14 @@
 #include "../desktop/rule/layerRule/LayerRule.hpp"
 #include "../debug/HyprCtl.hpp"
 #include "../desktop/state/FocusState.hpp"
+#include "../layout/space/Space.hpp"
+#include "../layout/supplementary/WorkspaceAlgoMatcher.hpp"
 #include "defaultConfig.hpp"
 
 #include "../render/Renderer.hpp"
 #include "../hyprerror/HyprError.hpp"
 #include "../managers/input/InputManager.hpp"
 #include "../managers/eventLoop/EventLoopManager.hpp"
-#include "../managers/LayoutManager.hpp"
 #include "../managers/EventManager.hpp"
 #include "../managers/permissions/DynamicPermissionManager.hpp"
 #include "../debug/HyprNotificationOverlay.hpp"
@@ -39,8 +40,10 @@
 #include "../managers/input/trackpad/gestures/CloseGesture.hpp"
 #include "../managers/input/trackpad/gestures/FloatGesture.hpp"
 #include "../managers/input/trackpad/gestures/FullscreenGesture.hpp"
+#include "../managers/input/trackpad/gestures/CursorZoomGesture.hpp"
 
-#include "../managers/HookSystemManager.hpp"
+#include "../event/EventBus.hpp"
+
 #include "../protocols/types/ContentType.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -560,6 +563,7 @@ CConfigManager::CConfigManager() {
     registerConfigVar("debug:overlay", Hyprlang::INT{0});
     registerConfigVar("debug:damage_blink", Hyprlang::INT{0});
     registerConfigVar("debug:pass", Hyprlang::INT{0});
+    registerConfigVar("debug:gl_debugging", Hyprlang::INT{0});
     registerConfigVar("debug:disable_logs", Hyprlang::INT{1});
     registerConfigVar("debug:disable_time", Hyprlang::INT{1});
     registerConfigVar("debug:enable_stdout_logs", Hyprlang::INT{0});
@@ -571,6 +575,10 @@ CConfigManager::CConfigManager() {
     registerConfigVar("debug:disable_scale_checks", Hyprlang::INT{0});
     registerConfigVar("debug:colored_stdout_logs", Hyprlang::INT{1});
     registerConfigVar("debug:full_cm_proto", Hyprlang::INT{0});
+    registerConfigVar("debug:ds_handle_same_buffer", Hyprlang::INT{1});
+    registerConfigVar("debug:ds_handle_same_buffer_fifo", Hyprlang::INT{1});
+    registerConfigVar("debug:fifo_pending_workaround", Hyprlang::INT{0});
+    registerConfigVar("debug:render_solitary_wo_damage", Hyprlang::INT{0});
 
     registerConfigVar("decoration:rounding", Hyprlang::INT{0});
     registerConfigVar("decoration:rounding_power", {2.F});
@@ -610,6 +618,9 @@ CConfigManager::CConfigManager() {
     registerConfigVar("decoration:screen_shader", {STRVAL_EMPTY});
     registerConfigVar("decoration:border_part_of_window", Hyprlang::INT{1});
 
+    registerConfigVar("layout:single_window_aspect_ratio", Hyprlang::VEC2{0, 0});
+    registerConfigVar("layout:single_window_aspect_ratio_tolerance", {0.1f});
+
     registerConfigVar("dwindle:pseudotile", Hyprlang::INT{0});
     registerConfigVar("dwindle:force_split", Hyprlang::INT{0});
     registerConfigVar("dwindle:permanent_direction_override", Hyprlang::INT{0});
@@ -622,8 +633,6 @@ CConfigManager::CConfigManager() {
     registerConfigVar("dwindle:smart_split", Hyprlang::INT{0});
     registerConfigVar("dwindle:smart_resizing", Hyprlang::INT{1});
     registerConfigVar("dwindle:precise_mouse_move", Hyprlang::INT{0});
-    registerConfigVar("dwindle:single_window_aspect_ratio", Hyprlang::VEC2{0, 0});
-    registerConfigVar("dwindle:single_window_aspect_ratio_tolerance", {0.1f});
 
     registerConfigVar("master:special_scale_factor", {1.f});
     registerConfigVar("master:mfact", {0.55f});
@@ -638,6 +647,14 @@ CConfigManager::CConfigManager() {
     registerConfigVar("master:smart_resizing", Hyprlang::INT{1});
     registerConfigVar("master:drop_at_cursor", Hyprlang::INT{1});
     registerConfigVar("master:always_keep_position", Hyprlang::INT{0});
+
+    registerConfigVar("scrolling:fullscreen_on_one_column", Hyprlang::INT{1});
+    registerConfigVar("scrolling:column_width", Hyprlang::FLOAT{0.5F});
+    registerConfigVar("scrolling:focus_fit_method", Hyprlang::INT{1});
+    registerConfigVar("scrolling:follow_focus", Hyprlang::INT{1});
+    registerConfigVar("scrolling:follow_min_visible", Hyprlang::FLOAT{0.4});
+    registerConfigVar("scrolling:explicit_column_widths", Hyprlang::STRING{"0.333, 0.5, 0.667, 1.0"});
+    registerConfigVar("scrolling:direction", Hyprlang::STRING{"right"});
 
     registerConfigVar("animations:enabled", Hyprlang::INT{1});
     registerConfigVar("animations:workspace_wraparound", Hyprlang::INT{0});
@@ -709,9 +726,9 @@ CConfigManager::CConfigManager() {
     registerConfigVar("binds:movefocus_cycles_fullscreen", Hyprlang::INT{0});
     registerConfigVar("binds:movefocus_cycles_groupfirst", Hyprlang::INT{0});
     registerConfigVar("binds:disable_keybind_grabbing", Hyprlang::INT{0});
-    registerConfigVar("binds:window_direction_monitor_fallback", Hyprlang::INT{1});
     registerConfigVar("binds:allow_pin_fullscreen", Hyprlang::INT{0});
     registerConfigVar("binds:drag_threshold", Hyprlang::INT{0});
+    registerConfigVar("binds:window_direction_monitor_fallback", Hyprlang::INT{1});
 
     registerConfigVar("gestures:workspace_swipe_distance", Hyprlang::INT{300});
     registerConfigVar("gestures:workspace_swipe_invert", Hyprlang::INT{1});
@@ -779,12 +796,14 @@ CConfigManager::CConfigManager() {
     registerConfigVar("render:new_render_scheduling", Hyprlang::INT{0});
     registerConfigVar("render:non_shader_cm", Hyprlang::INT{3});
     registerConfigVar("render:cm_sdr_eotf", Hyprlang::INT{0});
+    registerConfigVar("render:commit_timing_enabled", Hyprlang::INT{1});
 
     registerConfigVar("ecosystem:no_update_news", Hyprlang::INT{0});
     registerConfigVar("ecosystem:no_donation_nag", Hyprlang::INT{0});
     registerConfigVar("ecosystem:enforce_permissions", Hyprlang::INT{0});
 
     registerConfigVar("quirks:prefer_hdr", Hyprlang::INT{0});
+    registerConfigVar("quirks:skip_non_kms_dmabuf_formats", Hyprlang::INT{0});
 
     // devices
     m_config->addSpecialCategory("device", {"name"});
@@ -1049,7 +1068,7 @@ static void clearHlVersionVars() {
 }
 
 void CConfigManager::reload() {
-    EMIT_HOOK_EVENT("preConfigReload", nullptr);
+    Event::bus()->m_events.config.preReload.emit();
     setDefaultAnimationVars();
     resetHLConfig();
     m_configCurrentPath = getMainConfigPath();
@@ -1331,7 +1350,8 @@ void CConfigManager::postConfigReload(const Hyprlang::CParseResult& result) {
     static auto PZOOMFACTOR = CConfigValue<Hyprlang::FLOAT>("cursor:zoom_factor");
     for (auto const& m : g_pCompositor->m_monitors) {
         *(m->m_cursorZoom) = *PZOOMFACTOR;
-        g_pLayoutManager->getCurrentLayout()->recalculateMonitor(m->m_id);
+        if (m->m_activeWorkspace)
+            m->m_activeWorkspace->m_space->recalculate();
     }
 
     // Update the keyboard layout to the cfg'd one if this is not the first launch
@@ -1399,9 +1419,6 @@ void CConfigManager::postConfigReload(const Hyprlang::CParseResult& result) {
     // Update window border colors
     g_pCompositor->updateAllWindowsAnimatedDecorationValues();
 
-    // update layout
-    g_pLayoutManager->switchToLayout(std::any_cast<Hyprlang::STRING>(m_config->getConfigValue("general:layout")));
-
     // manual crash
     if (std::any_cast<Hyprlang::INT>(m_config->getConfigValue("debug:manual_crash")) && !m_manualCrashInitiated) {
         m_manualCrashInitiated = true;
@@ -1440,7 +1457,10 @@ void CConfigManager::postConfigReload(const Hyprlang::CParseResult& result) {
     if (!m_isFirstLaunch)
         ensurePersistentWorkspacesPresent();
 
-    EMIT_HOOK_EVENT("configReloaded", nullptr);
+    // update layouts
+    Layout::Supplementary::algoMatcher()->updateWorkspaceLayouts();
+
+    Event::bus()->m_events.config.reloaded.emit();
     if (g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"configreloaded", ""});
 }
@@ -1462,8 +1482,9 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
 
     // invalidate layouts if they changed
     if (COMMAND == "monitor" || COMMAND.contains("gaps_") || COMMAND.starts_with("dwindle:") || COMMAND.starts_with("master:")) {
-        for (auto const& m : g_pCompositor->m_monitors)
-            g_pLayoutManager->getCurrentLayout()->recalculateMonitor(m->m_id);
+        for (auto const& m : g_pCompositor->m_monitors) {
+            g_layoutManager->recalculateMonitor(m);
+        }
     }
 
     // Update window border colors
@@ -1635,6 +1656,8 @@ SWorkspaceRule CConfigManager::mergeWorkspaceRules(const SWorkspaceRule& rule1, 
         mergedRule.onCreatedEmptyRunCmd = rule2.onCreatedEmptyRunCmd;
     if (rule2.defaultName.has_value())
         mergedRule.defaultName = rule2.defaultName;
+    if (rule2.layout.has_value())
+        mergedRule.layout = rule2.layout;
     if (!rule2.layoutopts.empty()) {
         for (const auto& layoutopt : rule2.layoutopts) {
             mergedRule.layoutopts[layoutopt.first] = layoutopt.second;
@@ -1726,7 +1749,7 @@ void CConfigManager::performMonitorReload() {
 
     m_wantsMonitorReload = false;
 
-    EMIT_HOOK_EVENT("monitorLayoutChanged", nullptr);
+    Event::bus()->m_events.monitor.layoutChanged.emit();
 }
 
 void* const* CConfigManager::getConfigValuePtr(const std::string& val) {
@@ -1784,24 +1807,41 @@ void CConfigManager::ensureVRR(PHLMONITOR pMonitor) {
             }
             m->m_vrrActive = false;
             return;
-        } else if (USEVRR == 1) {
-            if (!m->m_vrrActive) {
-                m->m_output->state->resetExplicitFences();
-                m->m_output->state->setAdaptiveSync(true);
+        }
 
-                if (!m->m_state.test()) {
-                    Log::logger->log(Log::DEBUG, "Pending output {} does not accept VRR.", m->m_output->name);
-                    m->m_output->state->setAdaptiveSync(false);
+        const auto PWORKSPACE = m->m_activeWorkspace;
+
+        if (USEVRR == 1) {
+            bool wantVRR = true;
+            if (PWORKSPACE && PWORKSPACE->m_hasFullscreenWindow && (PWORKSPACE->m_fullscreenMode & FSMODE_FULLSCREEN))
+                wantVRR = !PWORKSPACE->getFullscreenWindow()->m_ruleApplicator->noVRR().valueOrDefault();
+
+            if (wantVRR) {
+                if (!m->m_vrrActive) {
+                    m->m_output->state->resetExplicitFences();
+                    m->m_output->state->setAdaptiveSync(true);
+
+                    if (!m->m_state.test()) {
+                        Log::logger->log(Log::DEBUG, "Pending output {} does not accept VRR.", m->m_output->name);
+                        m->m_output->state->setAdaptiveSync(false);
+                    }
+
+                    if (!m->m_state.commit())
+                        Log::logger->log(Log::ERR, "Couldn't commit output {} in ensureVRR -> true", m->m_output->name);
                 }
+                m->m_vrrActive = true;
+            } else {
+                if (m->m_vrrActive) {
+                    m->m_output->state->resetExplicitFences();
+                    m->m_output->state->setAdaptiveSync(false);
 
-                if (!m->m_state.commit())
-                    Log::logger->log(Log::ERR, "Couldn't commit output {} in ensureVRR -> true", m->m_output->name);
+                    if (!m->m_state.commit())
+                        Log::logger->log(Log::ERR, "Couldn't commit output {} in ensureVRR -> false", m->m_output->name);
+                }
+                m->m_vrrActive = false;
             }
-            m->m_vrrActive = true;
             return;
         } else if (USEVRR == 2 || USEVRR == 3) {
-            const auto PWORKSPACE = m->m_activeWorkspace;
-
             if (!PWORKSPACE)
                 return; // ???
 
@@ -2701,6 +2741,9 @@ std::optional<std::string> CConfigManager::handleWorkspaceRules(const std::strin
             opt             = opt.substr(0, opt.find(':'));
 
             wsRule.layoutopts[opt] = val;
+        } else if ((delim = rule.find("layout:")) != std::string::npos) {
+            std::string layout = rule.substr(delim + 7);
+            wsRule.layout      = std::move(layout);
         }
 
         return {};
@@ -2837,6 +2880,8 @@ std::optional<std::string> CConfigManager::handlePermission(const std::string& c
 
     if (data[1] == "screencopy")
         type = PERMISSION_TYPE_SCREENCOPY;
+    else if (data[1] == "cursorpos")
+        type = PERMISSION_TYPE_CURSOR_POS;
     else if (data[1] == "plugin")
         type = PERMISSION_TYPE_PLUGIN;
     else if (data[1] == "keyboard" || data[1] == "keeb")
@@ -2929,7 +2974,10 @@ std::optional<std::string> CConfigManager::handleGesture(const std::string& comm
     else if (data[startDataIdx] == "fullscreen")
         result = g_pTrackpadGestures->addGesture(makeUnique<CFullscreenTrackpadGesture>(std::string{data[startDataIdx + 1]}), fingerCount, direction, modMask, deltaScale,
                                                  disableInhibit);
-    else if (data[startDataIdx] == "unset")
+    else if (data[startDataIdx] == "cursorZoom") {
+        result = g_pTrackpadGestures->addGesture(makeUnique<CCursorZoomTrackpadGesture>(std::string{data[startDataIdx + 1]}, std::string{data[startDataIdx + 2]}), fingerCount,
+                                                 direction, modMask, deltaScale, disableInhibit);
+    } else if (data[startDataIdx] == "unset")
         result = g_pTrackpadGestures->removeGesture(fingerCount, direction, modMask, deltaScale, disableInhibit);
     else
         return std::format("Invalid gesture: {}", data[startDataIdx]);
@@ -3033,7 +3081,7 @@ bool CConfigManager::shouldUseSoftwareCursors(PHLMONITOR pMonitor) {
     switch (*PNOHW) {
         case 0: return false;
         case 1: return true;
-        case 2: return g_pHyprRenderer->isNvidia() && g_pHyprRenderer->isMgpu();
+        case 2: return g_pHyprRenderer->isNvidia() && (g_pHyprRenderer->isMgpu() || g_pCompositor->isVRRActiveOnAnyMonitor());
         default: break;
     }
 
@@ -3060,20 +3108,20 @@ std::string SConfigOptionDescription::jsonify() const {
                 else if (typeid(Hyprlang::FLOAT) == std::type_index(CONFIGVALUE.type()))
                     currentValue = std::format("{:.2f}", std::any_cast<Hyprlang::FLOAT>(CONFIGVALUE));
                 else if (typeid(Hyprlang::STRING) == std::type_index(CONFIGVALUE.type()))
-                    currentValue = std::any_cast<Hyprlang::STRING>(CONFIGVALUE);
+                    currentValue = std::format("\"{}\"", std::any_cast<Hyprlang::STRING>(CONFIGVALUE));
                 else if (typeid(Hyprlang::VEC2) == std::type_index(CONFIGVALUE.type())) {
                     const auto V = std::any_cast<Hyprlang::VEC2>(CONFIGVALUE);
-                    currentValue = std::format("{}, {}", V.x, V.y);
+                    currentValue = std::format("\"{}, {}\"", V.x, V.y);
                 } else if (typeid(void*) == std::type_index(CONFIGVALUE.type())) {
                     const auto DATA = sc<ICustomConfigValueData*>(std::any_cast<void*>(CONFIGVALUE));
-                    currentValue    = DATA->toString();
+                    currentValue    = std::format("\"{}\"", DATA->toString());
                 }
 
                 try {
                     using T = std::decay_t<decltype(val)>;
                     if constexpr (std::is_same_v<T, SStringData>) {
                         return std::format(R"#(     "value": "{}",
-        "current": "{}",
+        "current": {},
         "explicit": {})#",
                                            val.value, currentValue, EXPLICIT);
                     } else if constexpr (std::is_same_v<T, SRangeData>) {
@@ -3092,7 +3140,7 @@ std::string SConfigOptionDescription::jsonify() const {
                                            val.value, val.min, val.max, currentValue, EXPLICIT);
                     } else if constexpr (std::is_same_v<T, SColorData>) {
                         return std::format(R"#(     "value": "{}",
-        "current": "{}",
+        "current": {},
         "explicit": {})#",
                                            val.color.getAsHex(), currentValue, EXPLICIT);
                     } else if constexpr (std::is_same_v<T, SBoolData>) {
@@ -3113,12 +3161,12 @@ std::string SConfigOptionDescription::jsonify() const {
         "min_y": {},
         "max_x": {},
         "max_y": {},
-        "current": "{}",
+        "current": {},
         "explicit": {})#",
                                            val.vec.x, val.vec.y, val.min.x, val.min.y, val.max.x, val.max.y, currentValue, EXPLICIT);
                     } else if constexpr (std::is_same_v<T, SGradientData>) {
                         return std::format(R"#(     "value": "{}",
-        "current": "{}",
+        "current": {},
         "explicit": {})#",
                                            val.gradient, currentValue, EXPLICIT);
                     }
